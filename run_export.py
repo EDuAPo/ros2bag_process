@@ -3,44 +3,66 @@ import subprocess
 import os
 import sys
 import shutil
-from typing import List
+import yaml
+from typing import List, Dict, Any
 
-# --- 配置常量 (基于您提供的目录结构进行修正) ---
-# 假设主脚本位于 ~/workspace/xl/bag_parser/export_ros2bag/
+# --- 配置常量 ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(CURRENT_DIR, "config.yaml")
 
 EXPORT_CAMERA_SCRIPT = os.path.join(CURRENT_DIR, "export_camera.py")
 EXPORT_LIDAR_SCRIPT = os.path.join(CURRENT_DIR, "export_lidar.py")
 EXPORT_IMU_SCRIPT = os.path.join(CURRENT_DIR, "export_imu", "export_imu.py")
 UNDISTORTION_SCRIPT = os.path.join(CURRENT_DIR, "undistortion", "undistortion.py")
 EXTRACT_SAMPLE_SCRIPT = os.path.join(CURRENT_DIR, "extract_sample_undistorted.py")
+CHECK_AND_COMPRESS_SCRIPT = os.path.join(CURRENT_DIR, "check_and_compress.py")
 
-# ROS 2 自定义消息的安装路径 (用于 source)
-IMU_MSGS_INSTALL_PATH = os.path.join(CURRENT_DIR, "export_imu", "imu_msgs", "install")
 
-# 第4步 (undistortion) 所需的特定参数
-UNDISTORTION_PARAMS_DIR = os.path.join(CURRENT_DIR, "undistortion", "intrinsic_param")
-VEHICLE_MODEL = "vehicle_000"
-SCALE_MIN = "0.2"
-LOGTIME = "20251223" 
+def load_config() -> Dict[str, Any]:
+    """从 config.yaml 加载配置"""
+    if not os.path.exists(CONFIG_FILE):
+        print(f"❌ 错误: 配置文件不存在: {CONFIG_FILE}", file=sys.stderr)
+        sys.exit(1)
 
-def get_shell_setup_command() -> str:
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        return config
+    except Exception as e:
+        print(f"❌ 错误: 无法读取配置文件 {CONFIG_FILE}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_shell_setup_command(config: Dict[str, Any]) -> str:
     """
     检测当前运行的 shell 类型 (bash/zsh) 并返回 ROS 2 setup 命令。
+    需要 source 两个自定义消息包：msg_interfaces 和 imu_msgs
     """
     current_shell = os.environ.get('SHELL', 'bash').split('/')[-1]
-    
+
     if 'zsh' in current_shell:
         setup_file = "setup.zsh"
-        # print(f"检测到当前 Shell 为 ZSH，将使用 {setup_file}。")
     elif 'bash' in current_shell:
         setup_file = "setup.bash"
-        # print(f"检测到当前 Shell 为 BASH，将使用 {setup_file}。")
     else:
         setup_file = "setup.bash"
-        # print(f"检测到未知 Shell ({current_shell})，默认使用 setup.bash。")
-        
-    return f"source {os.path.join(IMU_MSGS_INSTALL_PATH, setup_file)}"
+
+    # 从配置文件读取 IMU 消息包基础路径
+    imu_base_path = config['paths']['imu_msgs_install_path']
+
+    # 构建绝对路径（如果是相对路径）
+    if not os.path.isabs(imu_base_path):
+        imu_base_path = os.path.join(CURRENT_DIR, imu_base_path)
+
+    # 两个包的路径（imu_base_path 指向 export_imu/msg_interfaces/install）
+    # 需要回退到 export_imu 目录
+    export_imu_dir = os.path.dirname(os.path.dirname(imu_base_path))
+    imu_msgs_install_path_1 = os.path.join(export_imu_dir, "msg_interfaces", "install")
+    imu_msgs_install_path_2 = os.path.join(export_imu_dir, "imu_msgs", "install")
+
+    # Source 两个包
+    setup_cmd1 = f"source {os.path.join(imu_msgs_install_path_1, setup_file)}"
+    setup_cmd2 = f"source {os.path.join(imu_msgs_install_path_2, setup_file)}"
+    return f"{setup_cmd1} && {setup_cmd2}"
 
 
 def run_command(command: List[str], step_name: str, use_shell: bool = False):
@@ -104,53 +126,67 @@ def adjust_directories(export_dir: str, undistorted_dir: str):
 
 
 def main():
+    # 加载配置文件
+    config = load_config()
+
     parser = argparse.ArgumentParser(
         description="ROS 2 Bag 数据导出与预处理流程调度脚本。"
     )
     parser.add_argument(
         "--bag",
         type=str,
-        required=True,
-        help="输入 ROS 2 Bag 目录的路径 (如: /home/user/data/bags/)"
+        required=False,
+        help="输入 ROS 2 Bag 目录的路径（可选，默认从 config.yaml 读取）"
     )
     parser.add_argument(
         "--out",
         type=str,
-        required=True,
-        help="主输出目录的路径 (所有中间和最终文件都将放在其子目录中)"
+        required=False,
+        help="主输出目录的路径（可选，默认从 config.yaml 读取）"
     )
-    # 【新增必需参数】
-    parser.add_argument("--vehicle", 
-                        type=str, 
-                        required=True, 
-                        help="指定车辆型号/配置，用于去畸变参数查找 (例如: vehicle_000)。")
+    parser.add_argument("--vehicle",
+                        type=str,
+                        required=False,
+                        help="指定车辆型号/配置（可选，默认从 config.yaml 读取）")
+    parser.add_argument("--logtime",
+                        type=str,
+                        required=False,
+                        help="指定日志时间戳（可选，默认从 config.yaml 读取）")
 
-    # 【新增必需参数】
-    parser.add_argument("--logtime", 
-                        type=str, 
-                        required=True, 
-                        help="指定日志时间戳，作为输出目录名的一部分 (例如: 20251104_160012)。")
-    
     args = parser.parse_args()
 
+    # --- 从配置文件或命令行参数获取配置 ---
+    INPUT_BAG_DIR = args.bag or config['paths']['source_bag_dir']
+    MAIN_OUTPUT_DIR = args.out or config['paths']['main_output_dir']
+    VEHICLE_MODEL = args.vehicle or config['vehicle']['model']
+    LOGTIME = args.logtime or config['vehicle']['logtime']
+    SCALE_MIN = str(config['processing']['scale_min'])
+    LIDAR_FORMAT = config['processing']['lidar_format']
+
+    # 去畸变参数目录
+    undistortion_params_dir = config['paths']['undistortion_params_dir']
+    if not os.path.isabs(undistortion_params_dir):
+        undistortion_params_dir = os.path.join(CURRENT_DIR, undistortion_params_dir)
+
     # --- 目录变量定义 ---
-    INPUT_BAG_DIR = args.bag
-    MAIN_OUTPUT_DIR = args.out
-    
-    # EXPORT_DIR = os.path.join(MAIN_OUTPUT_DIR, "exported_raw_data")
     EXPORT_DIR = os.path.join(MAIN_OUTPUT_DIR)
     UNDISTORTED_DIR = os.path.join(EXPORT_DIR, "undistorted")
     IMU_JSON_PATH = os.path.join(EXPORT_DIR, "ins.json")
-    
+
     # 确保输出目录存在
     os.makedirs(EXPORT_DIR, exist_ok=True)
     os.makedirs(UNDISTORTED_DIR, exist_ok=True)
 
-    print(f"🎬 流程开始。输入 Bag 目录: {INPUT_BAG_DIR}, 主输出目录: {MAIN_OUTPUT_DIR}")
-    
+    print(f"🎬 流程开始")
+    print(f"  输入 Bag: {INPUT_BAG_DIR}")
+    print(f"  输出目录: {MAIN_OUTPUT_DIR}")
+    print(f"  车辆型号: {VEHICLE_MODEL}")
+    print(f"  日志时间: {LOGTIME}")
+    print(f"  缩放比例: {SCALE_MIN}")
+
     # 获取 shell setup 命令
-    SHELL_SETUP_COMMAND = get_shell_setup_command()
-    print(f"检测到 Shell 环境，IMU Setup 命令: {SHELL_SETUP_COMMAND.split(' ')[1]}") # 打印 setup 文件名
+    SHELL_SETUP_COMMAND = get_shell_setup_command(config)
+    print(f"  IMU 消息包已配置")
 
 
     # =================================================================
@@ -170,7 +206,7 @@ def main():
         f"{sys.executable} {EXPORT_LIDAR_SCRIPT} "
         f"--bag {INPUT_BAG_DIR} "
         f"--out {EXPORT_DIR} "
-        f"--format pcd_binary"
+        f"--format {LIDAR_FORMAT}"
     )
     run_command([lidar_command_string], "[Export Step 2/6] 导出 Lidar 点云", use_shell=True)
     
@@ -184,12 +220,10 @@ def main():
     run_command([imu_command_string], "[Export Step 3/6] 导出 IMU/INS 数据 (需 Shell Setup)", use_shell=True)
     
     # --- 4. 图像去畸变 ---
-    VEHICLE_MODEL = args.vehicle
-    LOGTIME = args.logtime
     undistort_command_string = (
         f"{sys.executable} {UNDISTORTION_SCRIPT} "
         f"--images {EXPORT_DIR} "
-        f"--params {UNDISTORTION_PARAMS_DIR} "
+        f"--params {undistortion_params_dir} "
         f"--vehicle {VEHICLE_MODEL} "
         f"--out {UNDISTORTED_DIR} "
         f"--scale_min {SCALE_MIN} "
@@ -207,8 +241,17 @@ def main():
     )
     run_command([extract_command_string], "[Export Step 6/6] 提取样本", use_shell=True)
 
-    print("\n\n🎉🎉🎉 预处理导出阶段完成 (6个内部步骤已执行) 🎉🎉🎉")
+    # --- 7. 压缩数据 (可选，使用 bag 时间戳作为日期) ---
+    compress_command_string = (
+        f"{sys.executable} {CHECK_AND_COMPRESS_SCRIPT} "
+        f"--undistorted-path {UNDISTORTED_DIR} "
+        f"--bag-path {INPUT_BAG_DIR}"
+    )
+    run_command([compress_command_string], "[Export Step 7/7] 压缩数据", use_shell=True)
+
+    print("\n\n🎉🎉🎉 预处理导出阶段完成 (7个内部步骤已执行) 🎉🎉🎉")
     print(f"最终数据位于: {UNDISTORTED_DIR}")
+    print(f"压缩包将自动生成在 {MAIN_OUTPUT_DIR} 下，使用 bag 日期作为前缀")
 
 
 if __name__ == "__main__":

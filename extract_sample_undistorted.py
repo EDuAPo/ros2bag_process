@@ -308,13 +308,18 @@ def generate_key_frames(root_dir, copy_sample, max_time_diff_ms):
             skipped_frames += 1
             continue
         
-        # 检查除了camera_cam_8M_pt_front外，其他topic是否都有文件
+        # 检查除了camera_cam_8M_pt_front外，其他实际存在的topic是否都有文件
         has_missing_required_topic = False
         for topic in ALL_TOPICS_TO_PROCESS:
-            if topic != 'camera_cam_8M_pt_front' and topic not in consistent_files:
-                print(f"Warning: 关键帧时间戳 {lidar_dt} 缺少必要的topic '{topic}'，跳过该帧。")
-                has_missing_required_topic = True
-                break
+            # 跳过不存在的topic目录和camera_cam_8M_pt_front
+            if topic == 'camera_cam_8M_pt_front':
+                continue
+            # 只检查实际存在目录的topic
+            if topic in all_topic_files_dt and len(all_topic_files_dt[topic]) > 0:
+                if topic not in consistent_files:
+                    print(f"Warning: 关键帧时间戳 {lidar_dt} 缺少必要的topic '{topic}'，跳过该帧。")
+                    has_missing_required_topic = True
+                    break
         
         if has_missing_required_topic:
             skipped_frames += 1

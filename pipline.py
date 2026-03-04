@@ -10,20 +10,34 @@ import time
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Set
 
+# 尝试导入统一配置
+try:
+    from config_loader import config as global_config
+    USE_UNIFIED_CONFIG = True
+except ImportError:
+    USE_UNIFIED_CONFIG = False
+    global_config = None
+
 # ===================== 配置区域 =====================
 # 1. 核心脚本路径
 FILTER_SCRIPT_PATH = "./move_file.py"  # 筛选脚本
 RUN_EXPORT_SCRIPT_PATH = "./run_export.py"  # 预处理脚本
 CHECK_COMPRESS_SCRIPT_PATH = "./check_and_compress.py"  # 检查压缩脚本
 
-# 2. 基础配置
-DEFAULT_VEHICLE = "vehicle_000"
-DEFAULT_MAIN_OUT = "/media/zgw/T7/1223out/"  # 预处理主输出目录
-TIME_PERIODS_YAML = "./time_peridos.yaml"  # 时间段配置文件
+# 2. 基础配置（优先使用统一配置文件）
+if USE_UNIFIED_CONFIG:
+    DEFAULT_VEHICLE = global_config.vehicle_model
+    DEFAULT_MAIN_OUT = global_config.main_output_dir
+    TIME_PERIODS_YAML = "./time_peridos.yaml"
+    MOVE_RECORD_DIR = global_config.move_record_dir
+else:
+    DEFAULT_VEHICLE = "vehicle_000"
+    DEFAULT_MAIN_OUT = "/media/zgw/T7/0209out/"
+    TIME_PERIODS_YAML = "./time_peridos.yaml"
+    MOVE_RECORD_DIR = "/media/zgw/T7/0209out/"
 
 # 3. 新增：移动模式配置
 MOVE_MODE = True  # 是否使用移动模式（默认True，最节省空间）
-MOVE_RECORD_DIR = "/media/zgw/T7/1223out/"  # 移动记录保存目录
 
 # 4. 新增：检查压缩功能配置
 SKIP_CHECK_COMPRESS = False  # 是否跳过压缩流程（默认不跳过）
@@ -93,13 +107,21 @@ def load_time_periods(yaml_path: str) -> List[Tuple[str, str]]:
 
 
 def get_filter_script_config() -> tuple[str, str]:
-    """从 filter_by_time.py 中读取真实的默认配置"""
+    """从统一配置文件或 move_file.py 中读取默认配置"""
+    # 优先从统一配置文件读取
+    try:
+        from config_loader import config
+        return config.source_bag_dir, config.temp_filter_dir
+    except ImportError:
+        pass  # 配置加载器不存在，回退到旧方式
+
+    # 回退：从 move_file.py 文件中解析配置
     if not os.path.exists(FILTER_SCRIPT_PATH):
         raise FileNotFoundError(f"未找到筛选脚本：{FILTER_SCRIPT_PATH}")
-    
+
     with open(FILTER_SCRIPT_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
-    
+
     # 匹配默认配置（修改后的模式）
     source_match = re.search(r'DEFAULT_SOURCE_DIRECTORY\s*=\s*"([^"]+)"', content)
     if not source_match:
@@ -107,14 +129,14 @@ def get_filter_script_config() -> tuple[str, str]:
         source_match = re.search(r'SOURCE_DIRECTORY\s*=\s*"([^"]+)"', content)
         if not source_match:
             raise ValueError(f"未在 {FILTER_SCRIPT_PATH} 中找到源目录配置")
-    
+
     output_match = re.search(r'DEFAULT_OUTPUT_ROOT_DIRECTORY\s*=\s*"([^"]+)"', content)
     if not output_match:
         # 回退到旧模式
         output_match = re.search(r'OUTPUT_ROOT_DIRECTORY\s*=\s*"([^"]+)"', content)
         if not output_match:
             raise ValueError(f"未在 {FILTER_SCRIPT_PATH} 中找到输出目录配置")
-    
+
     return source_match.group(1).strip(), output_match.group(1).strip()
 
 
@@ -179,27 +201,42 @@ def validate_time_format(time_str: str) -> bool:
 
 
 def modify_filter_script(start_time: str, end_time: str) -> None:
-    """修改 filter_by_time.py 的默认时间配置"""
+    """
+    修改 move_file.py 的默认时间配置
+    注意：使用统一配置文件后，此功能已不再需要，保留仅为兼容性
+    """
+    # 检查是否使用统一配置
+    if USE_UNIFIED_CONFIG:
+        print(f"✅ 使用统一配置文件，跳过脚本内时间更新")
+        print(f"   - 开始时间：{start_time}（HHMMSS）")
+        print(f"   - 结束时间：{end_time}（HHMMSS）")
+        return
+
+    # 旧方式：直接修改脚本文件（已废弃）
     with open(FILTER_SCRIPT_PATH, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    
+
     updated_lines = []
     for line in lines:
+        # 保留原有缩进
+        indent = len(line) - len(line.lstrip())
+        indent_str = line[:indent]
+
         if line.strip().startswith("DEFAULT_TARGET_START_TIME"):
-            updated_lines.append(f'DEFAULT_TARGET_START_TIME = "{start_time}"  # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            updated_lines.append(f'{indent_str}DEFAULT_TARGET_START_TIME = "{start_time}"  # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         elif line.strip().startswith("DEFAULT_TARGET_END_TIME"):
-            updated_lines.append(f'DEFAULT_TARGET_END_TIME = "{end_time}"    # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            updated_lines.append(f'{indent_str}DEFAULT_TARGET_END_TIME = "{end_time}"    # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         # 也处理旧的配置名称
         elif line.strip().startswith("TARGET_START_TIME") and not line.strip().startswith("DEFAULT_"):
-            updated_lines.append(f'TARGET_START_TIME = "{start_time}"  # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            updated_lines.append(f'{indent_str}TARGET_START_TIME = "{start_time}"  # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         elif line.strip().startswith("TARGET_END_TIME") and not line.strip().startswith("DEFAULT_"):
-            updated_lines.append(f'TARGET_END_TIME = "{end_time}"    # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            updated_lines.append(f'{indent_str}TARGET_END_TIME = "{end_time}"    # 自动更新于 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         else:
             updated_lines.append(line)
-    
+
     with open(FILTER_SCRIPT_PATH, 'w', encoding='utf-8') as f:
         f.writelines(updated_lines)
-    
+
     print(f"✅ 已更新筛选脚本的时间段配置：")
     print(f"   - 开始时间：{start_time}（HHMMSS）")
     print(f"   - 结束时间：{end_time}（HHMMSS）")
@@ -226,48 +263,52 @@ def save_move_record(period_idx: int, start_time: str, end_time: str, moved_file
 
 
 def restore_moved_files(record_path: str) -> Tuple[int, int]:
-    """根据记录文件恢复移动的文件，返回（成功数，总数）"""
+    """根据记录文件恢复移动的文件，返回（成功数，总数）。
+    记录文件格式：{目标路径: 原始路径}，由 move_file.py 实时写入。
+    """
     if not os.path.exists(record_path):
         print(f"⚠️  记录文件不存在：{record_path}")
         return 0, 0
-    
+
     try:
         with open(record_path, 'r', encoding='utf-8') as f:
-            record_data = json.load(f)
-        
-        moved_files = record_data['moved_files']
+            moved_files = json.load(f)  # 直接是 {dest: src} 字典
+
         total_files = len(moved_files)
         success_count = 0
-        
+
         print(f"🔄 正在恢复 {total_files} 个db3文件...")
-        
+
         for dest_path, src_path in moved_files.items():
             try:
-                # 检查目标文件是否存在（即移动后的位置）
                 if os.path.exists(dest_path):
-                    # 确保源目录存在
                     src_dir = os.path.dirname(src_path)
                     os.makedirs(src_dir, exist_ok=True)
-                    
-                    # 移动文件回原始位置
                     shutil.move(dest_path, src_path)
-                    # 检查是否成功移回
                     if os.path.exists(src_path):
                         success_count += 1
                         print(f"   ✅ 已恢复：{os.path.basename(dest_path)} -> {src_path}")
                     else:
-                        print(f"   ❌ 恢复失败：移动操作后源文件不存在 {src_path}")
+                        print(f"   ❌ 恢复失败：移动后源路径不存在 {src_path}")
+                elif os.path.exists(src_path):
+                    # 文件已在原始位置（可能之前恢复过），视为成功
+                    success_count += 1
+                    print(f"   ✅ 已在原位：{os.path.basename(dest_path)}")
                 else:
-                    print(f"   ⚠️  跳过：文件不存在于目标位置 {dest_path}")
+                    print(f"   ❌ 文件两端均不存在，无法恢复：{os.path.basename(dest_path)}")
             except Exception as e:
                 print(f"   ❌ 恢复失败：{os.path.basename(dest_path)} - {str(e)}")
-        
-        # 删除记录文件
-        os.remove(record_path)
+
         print(f"\n✅ 文件恢复完成：成功 {success_count}/{total_files}")
-        
+
+        # 仅在全部恢复成功时才删除记录文件，否则保留供人工排查
+        if success_count == total_files:
+            os.remove(record_path)
+        else:
+            print(f"⚠️  恢复不完整，记录文件保留供排查：{record_path}")
+
         return success_count, total_files
-        
+
     except Exception as e:
         print(f"❌ 读取记录文件失败：{str(e)}")
         return 0, 0

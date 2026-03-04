@@ -1,0 +1,108 @@
+# ==================== ROS2 Bag 预处理流水线配置文件 ====================
+# 说明：所有脚本共享此配置，避免在多处修改路径
+
+# ---------- 路径配置 ----------
+paths:
+  # 原始bag文件存放目录
+  source_bag_dir: "/home/zgw/Desktop/NAS/original_ros2bag/fenglinkechuangyuan/20260119/"
+
+  # 主输出目录（所有处理结果存放位置）
+  main_output_dir: "/media/zgw/T7/0209out/"
+
+  # 临时筛选目录（移动模式下的中转目录）
+  temp_filter_dir: "/tmp/test_filter_out/"
+
+  # 移动记录文件存放目录
+  move_record_dir: "/media/zgw/T7/0209out/"
+
+  # 去畸变参数目录
+  undistortion_params_dir: "./undistortion/intrinsic_param"
+
+  # IMU自定义消息安装路径
+  imu_msgs_install_path: "./export_imu/msg_interfaces/install"
+
+# ---------- 时间段配置 ----------
+time_periods:
+  # 格式：[开始时间HHMMSS, 结束时间HHMMSS]
+  # 可配置多个时间段，流水线会依次处理
+  - [155143, 155244]
+  # - [160000, 161000]  # 可添加更多时间段
+
+# ---------- 车辆配置 ----------
+vehicle:
+  # 车辆型号（用于查找对应的去畸变参数）
+  model: "vehicle_000"
+
+  # 日志时间戳（用于输出目录命名）
+  logtime: "20260119"
+
+# ---------- 处理参数 ----------
+processing:
+  # 图像缩放最小比例
+  scale_min: 0.2
+
+  # 点云导出格式：pcd_binary, pcd_ascii, ply
+  lidar_format: "pcd_binary"
+
+  # 是否使用移动模式（true=移动原始文件，false=复制文件）
+  move_mode: false
+
+# ---------- 压缩配置 ----------
+compression:
+  # 最小压缩包大小（GB）
+  min_zip_size_gb: 4
+
+  # 所需最小剩余空间（GB）
+  required_free_space_gb: 100
+
+  # 必需的JSON文件列表
+  required_json_files:
+    - "sensor_config_combined_latest.json"
+    - "ins.json"
+    - "sample.json"
+
+  # 文件夹结构验证规则
+  folder_groups:
+    cameras:
+      - "camera_cam_3M_front/scale_0.20"
+      - "camera_cam_3M_left/scale_0.20"
+      - "camera_cam_3M_rear/scale_0.20"
+      - "camera_cam_3M_right/scale_0.20"
+      - "camera_cam_8M_pt_front/scale_0.20"
+      - "camera_cam_8M_wa_front/scale_0.20"
+
+    lidars:
+      - "iv_points_front_left/pcd_binary"
+      - "iv_points_front_mid/pcd_binary"
+      - "iv_points_front_right/pcd_binary"
+      - "iv_points_left_mid/pcd_binary"
+      - "iv_points_right_mid/pcd_binary"
+      - "iv_points_rear_left/pcd_binary"
+      - "iv_points_rear_right/pcd_binary"
+
+    keep_folders:
+      - "undistorted"
+      - "combined_scales"
+
+# ---------- 传感器配置 ----------
+# 注意：传感器标定参数仍保留在 config/ 目录的Python文件中
+# 因为它们包含复杂的矩阵数据，更适合用Python dict表示
+sensors:
+  # 相机列表（用于导出）
+  cameras:
+    - "cam_3M_front"
+    - "cam_3M_left"
+    - "cam_3M_rear"
+    - "cam_3M_right"
+    - "cam_8M_pt_front"
+    - "cam_8M_wa_front"
+
+  # 激光雷达列表（用于导出）
+  lidars:
+    - "front_left"
+    - "front_mid"
+    - "front_right"
+    - "left_mid"
+    - "right_mid"
+    - "rear_left"
+    - "rear_right"

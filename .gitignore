@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ROS2
+install/
+build/
+log/
+
+# 数据文件
+*.db3
+*.bag
+*.pcd
+*.ply
+*.jpg
+*.png
+*.json
+
+# 配置文件（包含敏感路径）
+config.yaml
+
+# 临时文件
+*.tmp
+*.log
+*.bak
+
+# 系统文件
+.DS_Store
+Thumbs.db

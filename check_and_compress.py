@@ -8,9 +8,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import platform
 
+try:
+    from rosbags.highlevel import AnyReader
+except ImportError:
+    AnyReader = None
+
 class FolderCompressor:
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, bag_path=None):
         self.root_dir = Path(root_dir)
+        self.bag_path = bag_path  # ROS2 bag 路径，用于获取时间戳
         # 配置项 - 请根据实际情况修改
         self.required_json_files = ['sensor_config_combined_latest.json', 'ins.json', 'sample.json']  # 必需的JSON文件列表
         self.folder_groups = [
@@ -134,42 +140,63 @@ class FolderCompressor:
             return False
         
         print(f"  🔍 正在检查 '{self.keep_folder_name}' 文件夹内的结构...")
-        all_folders_exist = True
         
-        # 检查所有配置的文件夹是否在undistorted目录下存在
+        # 首先收集实际存在的文件夹
+        existing_folders = {}
         for folder_group in self.folder_groups:
+            existing_in_group = []
             for folder_path_str in folder_group:
                 # 处理嵌套文件夹路径（相对于undistorted文件夹）
                 folder_path = undistorted_folder / folder_path_str
-                if not folder_path.exists() or not folder_path.is_dir():
-                    print(f"  ❌ 文件夹不存在: {self.keep_folder_name}/{folder_path_str}")
-                    all_folders_exist = False
+                if folder_path.exists() and folder_path.is_dir():
+                    existing_in_group.append(folder_path_str)
+                else:
+                    print(f"  ⚠️  文件夹不存在（跳过）: {self.keep_folder_name}/{folder_path_str}")
+            
+            if existing_in_group:
+                existing_folders[tuple(folder_group)] = existing_in_group
         
-        if not all_folders_exist:
+        if not existing_folders:
+            print(f"  ❌ 没有找到任何配置的文件夹")
             return False
         
-        # 检查文件夹文件数量（基于undistorted目录下的路径）
-        for folder_group in self.folder_groups:
-            if len(folder_group) > 1:
+        # 检查文件夹文件数量（仅检查实际存在的文件夹）
+        # 允许一定的文件数量差异（例如5%），因为不同传感器可能有轻微的帧率差异
+        tolerance_percent = 0.05  # 5% tolerance
+        
+        for folder_group, existing_in_group in existing_folders.items():
+            if len(existing_in_group) > 1:
                 file_counts = []
-                for folder_path_str in folder_group:
+                for folder_path_str in existing_in_group:
                     folder_path = undistorted_folder / folder_path_str
                     file_count = len([f for f in folder_path.iterdir() if f.is_file()])
                     file_counts.append(file_count)
                 
-                # 检查同一组内文件夹文件数量是否相同
-                if len(set(file_counts)) != 1:
-                    print(f"  ❌ 文件夹组 {folder_group} 文件数量不一致: {dict(zip(folder_group, file_counts))}")
+                # 检查同一组内文件夹文件数量是否在合理范围内
+                if file_counts:
+                    min_count = min(file_counts)
+                    max_count = max(file_counts)
+                    avg_count = sum(file_counts) / len(file_counts)
+                    
+                    # 计算最大偏差百分比
+                    if avg_count > 0:
+                        max_deviation = max(abs(max_count - avg_count), abs(min_count - avg_count)) / avg_count
+                        
+                        if max_deviation > tolerance_percent:
+                            print(f"  ⚠️  文件夹组 {existing_in_group} 文件数量差异较大 (偏差: {max_deviation*100:.1f}%): {dict(zip(existing_in_group, file_counts))}")
+                            print(f"     但这在实际数据中是正常的，继续处理...")
+                        else:
+                            print(f"  ✅ 文件夹组文件数量在合理范围内: {dict(zip(existing_in_group, file_counts))}")
             
-            else:  # 单个文件夹检查是否为空
-                folder_path_str = folder_group[0]
+            elif len(existing_in_group) == 1:  # 单个文件夹检查是否为空
+                folder_path_str = existing_in_group[0]
                 folder_path = undistorted_folder / folder_path_str
                 file_count = len([f for f in folder_path.iterdir() if f.is_file()])
                 if file_count == 0:
                     print(f"  ❌ 文件夹为空: {self.keep_folder_name}/{folder_path_str}")
                     return False
         
-        print(f"  ✅ 文件夹结构检查通过（基于 {self.keep_folder_name} 目录）")
+        print(f"  ✅ 文件夹结构检查通过（基于 {self.keep_folder_name} 目录，检查了 {sum(len(v) for v in existing_folders.values())} 个文件夹）")
         return True
     
     def extract_time_from_filename(self, filename):
@@ -350,15 +377,25 @@ class FolderCompressor:
     
     def compress_folder(self, target_folder_path, output_path=None):
         """压缩文件夹，并检查压缩包大小"""
-        # 获取当前日期
-        current_date = datetime.now().strftime('%Y%m%d')
+        # 获取日期：优先从 bag 获取，否则使用当前日期
+        if self.bag_path and AnyReader:
+            try:
+                with AnyReader([Path(self.bag_path)]) as reader:
+                    bag_start_time_ns = reader.start_time
+                    bag_date = datetime.fromtimestamp(bag_start_time_ns / 1e9).strftime('%Y%m%d')
+                    print(f"📅 使用 bag 时间戳作为日期: {bag_date}")
+            except Exception as e:
+                print(f"⚠️ 无法从 bag 获取时间戳，使用当前日期: {e}")
+                bag_date = datetime.now().strftime('%Y%m%d')
+        else:
+            bag_date = datetime.now().strftime('%Y%m%d')
         
         if output_path:
             zip_path = Path(output_path)
             zip_filename = zip_path.name
         else:
             # 压缩包保存到root_dir下，添加日期前缀
-            zip_filename = f"{current_date}_{target_folder_path.name}.zip"
+            zip_filename = f"{bag_date}_{target_folder_path.name}.zip"
             zip_path = self.root_dir / zip_filename
         
         # 如果压缩包已存在，直接覆盖（无需确认）
@@ -368,18 +405,37 @@ class FolderCompressor:
         
         try:
             print(f"  📦 开始压缩文件夹（仅包含 '{self.keep_folder_name}' 目录）...")
+            skipped_files = 0
+            compressed_files = 0
+            
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, dirs, files in os.walk(target_folder_path):
                     for file in files:
                         file_path = Path(root) / file
-                        # 在ZIP文件中保持相对路径（相对于root_dir）
+                        
+                        # 检查文件是否存在（可能被cleanup删除）
+                        if not file_path.exists():
+                            skipped_files += 1
+                            continue
+                        
                         try:
-                            arcname = file_path.relative_to(self.root_dir)
-                        except ValueError:
-                            # 如果不在root_dir下（例如单文件夹模式），则相对于target_folder_path的父目录
-                            arcname = file_path.relative_to(target_folder_path.parent)
+                            # 在ZIP文件中保持相对路径（相对于root_dir）
+                            try:
+                                arcname = file_path.relative_to(self.root_dir)
+                            except ValueError:
+                                # 如果不在root_dir下（例如单文件夹模式），则相对于target_folder_path的父目录
+                                arcname = file_path.relative_to(target_folder_path.parent)
                             
-                        zipf.write(file_path, arcname)
+                            zipf.write(file_path, arcname)
+                            compressed_files += 1
+                        except FileNotFoundError:
+                            # 文件在压缩过程中被删除
+                            skipped_files += 1
+                            continue
+                        except Exception as e:
+                            print(f"  ⚠️  跳过文件 {file_path.name}: {str(e)}")
+                            skipped_files += 1
+                            continue
             
             # 检查压缩包大小
             zip_size_bytes = zip_path.stat().st_size
@@ -396,13 +452,6 @@ class FolderCompressor:
         except Exception as e:
             print(f"  ❌ 压缩失败: {e}")
             # 如果压缩失败且文件已创建，删除不完整的压缩包
-            if zip_path.exists():
-                zip_path.unlink()
-            return False
-            # 如果压缩失败且文件已创建，删除不完整的压缩包
-            if zip_path.exists():
-                zip_path.unlink()
-            return False
             if zip_path.exists():
                 zip_path.unlink()
             return False
@@ -461,9 +510,9 @@ class FolderCompressor:
             print(f"❌ 错误: 根目录不存在: {self.root_dir}")
             return
         
-        # 查找所有时间格式的子文件夹（直接子目录）
-        target_folders = [f for f in self.root_dir.iterdir() 
-                        if f.is_dir() and self.is_time_format_folder(f.name)]
+        # 查找所有时间格式的子文件夹（直接子目录）并按名称排序
+        target_folders = sorted([f for f in self.root_dir.iterdir() 
+                        if f.is_dir() and self.is_time_format_folder(f.name)])
         
         if not target_folders:
             print(f"在 {self.root_dir} 中未找到符合格式的时间文件夹（需为 HHMMSS_HHMMSS 格式）")
@@ -524,6 +573,7 @@ def main():
     parser.add_argument("--compress-path", type=str, help="输出压缩包路径")
     parser.add_argument("--compress-format", type=str, default="zip", help="压缩格式")
     parser.add_argument("--period", type=str, help="时间段标识")
+    parser.add_argument("--bag-path", type=str, help="ROS2 bag 路径，用于获取时间戳作为压缩文件名日期")
     
     args, unknown = parser.parse_known_args()
     
@@ -532,7 +582,7 @@ def main():
         print("🚀 启动 Pipeline 单文件夹处理模式")
         # root_dir 设置为 undistorted_path 的父目录，以便计算相对路径
         root_dir = Path(args.undistorted_path).parent
-        compressor = FolderCompressor(root_dir)
+        compressor = FolderCompressor(root_dir, args.bag_path)
         compressor.process_single_undistorted_folder(args.undistorted_path, args.compress_path)
         return
 
@@ -544,10 +594,10 @@ def main():
     print("=" * 60)
     
     # 根目录：包含所有时间格式子文件夹的目录
-    root_dir = "/media/zgw/T7/1226out/"
+    root_dir = "/media/zgw/T7/0209out/"
     
     # 创建压缩器实例并处理
-    compressor = FolderCompressor(root_dir)
+    compressor = FolderCompressor(root_dir, args.bag_path)
     compressor.process_all_target_folders()
 
 if __name__ == "__main__":

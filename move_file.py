@@ -5,33 +5,42 @@ import sys
 import subprocess
 import json
 import argparse
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from config_loader import config
 
 # ------------------- 默认配置 -------------------
-# 保持原有配置，但会被命令行参数覆盖
-DEFAULT_SOURCE_DIRECTORY = "/media/zgw/T7/1223/rosbag2_2025_12_23-16_50_10/"
-DEFAULT_OUTPUT_ROOT_DIRECTORY = "/media/zgw/T7/1223/out/"
-DEFAULT_TARGET_START_TIME = "174231"  # 自动更新于 2025-12-27 02:42:34
-DEFAULT_TARGET_END_TIME = "174400"    # 自动更新于 2025-12-27 02:42:34
+# 从统一配置文件加载默认值，可被命令行参数覆盖
+DEFAULT_SOURCE_DIRECTORY = config.source_bag_dir
+DEFAULT_OUTPUT_ROOT_DIRECTORY = config.temp_filter_dir
+# 时间段从配置文件读取（如果存在）
+if config.time_periods:
+    DEFAULT_TARGET_START_TIME = str(config.time_periods[0][0])
+    DEFAULT_TARGET_END_TIME = str(config.time_periods[0][1])
+else:
+    DEFAULT_TARGET_START_TIME = "134448"
+    DEFAULT_TARGET_END_TIME = "134518"
 # ----------------------------------------------
 
-def copy_rosbag_files(source_dir: str, output_root_dir: str, start_time_str: str, end_time_str: str, move_mode: bool = False) -> Dict[str, str]:
+def copy_rosbag_files(source_dir: str, output_root_dir: str, start_time_str: str, end_time_str: str,
+                      move_mode: bool = False, record_path: Optional[str] = None) -> Dict[str, str]:
     """
-    转移指定时间段内的rosbag文件（db3），并通过ROS 2原生指令生成标准metadata.yaml
+    转移指定时间段内的rosbag文件（db3），并通过ROS 2原生指令生成标准metadata.yaml。
+    移动模式下，record_path 指定记录文件路径，每移动一个文件立即写入，确保崩溃可恢复。
     """
     # 验证输入参数
     _validate_inputs(source_dir, output_root_dir, start_time_str, end_time_str)
-    
+
     # 解析用户输入时间
     user_hh_start, user_mm_start, user_ss_start = _parse_time_str(start_time_str)
     user_hh_end, user_mm_end, user_ss_end = _parse_time_str(end_time_str)
-    
+
     # 1. 查找并解析所有符合格式的db3文件
     all_db3_files = _find_and_parse_db3_files(source_dir)
     if not all_db3_files:
         raise FileNotFoundError(f"源文件夹 {source_dir} 中未找到符合格式的db3文件")
-    
+
     # 2. 匹配用户指定时间段的db3文件（时间范围交集）
     matching_db3_files = _match_db3_by_time(
         all_db3_files,
@@ -41,17 +50,17 @@ def copy_rosbag_files(source_dir: str, output_root_dir: str, start_time_str: str
     if not matching_db3_files:
         print(f"未找到与时间段 {start_time_str} - {end_time_str} 有交集的db3文件")
         return {}
-    
-    # 3. 创建输出文件夹并转移db3文件
+
+    # 3. 创建输出文件夹并转移db3文件（移动模式下实时写入记录）
     output_dir = _create_output_dir(output_root_dir, start_time_str, end_time_str)
-    moved_files = _transfer_db3_files(matching_db3_files, output_dir, move_mode)
-    
+    moved_files = _transfer_db3_files(matching_db3_files, output_dir, move_mode, record_path)
+
     # 4. 调用ROS 2指令生成yaml（兼容版：重定向输出+格式清理）
     _generate_yaml_by_ros2_compatible(output_dir)
-    
+
     operation = "移动" if move_mode else "复制"
     print(f"\n操作完成！共{operation} {len(matching_db3_files)} 个db3文件，并生成标准 metadata.yaml 到 {output_dir}")
-    
+
     return moved_files
 
 
@@ -72,39 +81,56 @@ def _parse_time_str(time_str: str) -> Tuple[int, int, int]:
     return int(time_str[:2]), int(time_str[2:4]), int(time_str[4:6])
 
 
+def _query_db3_time_range(db3_path: str):
+    """从 sqlite3 messages 表读取该 db3 文件的精确时间范围（纳秒时间戳）。
+    返回 (min_ns, max_ns)，失败返回 (None, None)。
+    """
+    try:
+        conn = sqlite3.connect(db3_path)
+        cur = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM messages")
+        tmin, tmax = cur.fetchone()
+        conn.close()
+        if tmin is None or tmax is None:
+            return None, None
+        return int(tmin), int(tmax)
+    except Exception as e:
+        print(f"警告：读取 {os.path.basename(db3_path)} 时间范围失败：{e}")
+        return None, None
+
+
 def _find_and_parse_db3_files(source_dir: str) -> List[Dict]:
-    """查找源文件夹中所有符合格式的db3文件，并解析基础信息"""
+    """查找源文件夹中所有符合格式的db3文件，通过查询 sqlite3 获取精确时间范围。"""
     db3_pattern = r"rosbag2_(\d{4}_\d{2}_\d{2})-(\d{2}_\d{2}_\d{2})_(\d+)\.db3"
     all_db3_files = []
-    
-    for filename in os.listdir(source_dir):
-        match = re.match(db3_pattern, filename)
-        if match:
-            try:
-                date_str = match.group(1)
-                base_time_str = match.group(2)
-                seq_num = int(match.group(3))
-                
-                # 计算实际开始时间
-                base_hh, base_mm, base_ss = _parse_time_str(base_time_str.replace("_", ""))
-                base_datetime = datetime.strptime(
-                    f"{date_str} {base_hh:02d}:{base_mm:02d}:{base_ss:02d}",
-                    "%Y_%m_%d %H:%M:%S"
-                )
-                actual_start = base_datetime + timedelta(minutes=seq_num)
-                
-                all_db3_files.append({
-                    "filename": filename,
-                    "date_str": date_str,
-                    "seq_num": seq_num,
-                    "actual_start": actual_start,
-                    "path": os.path.join(source_dir, filename)
-                })
-            except Exception as e:
-                print(f"警告：跳过格式异常的文件 {filename}，错误：{str(e)}")
+
+    for root, _, files in os.walk(source_dir):
+        for filename in files:
+            if not filename.endswith('.db3'):
                 continue
-    
-    # 按实际开始时间排序
+
+            match = re.match(db3_pattern, filename)
+            if not match:
+                continue
+
+            path = os.path.join(root, filename)
+            date_str = match.group(1)
+
+            tmin_ns, tmax_ns = _query_db3_time_range(path)
+            if tmin_ns is None:
+                print(f"警告：跳过无法读取时间的文件 {filename}")
+                continue
+
+            actual_start = datetime.fromtimestamp(tmin_ns / 1e9)
+            actual_end   = datetime.fromtimestamp(tmax_ns / 1e9)
+
+            all_db3_files.append({
+                "filename":     filename,
+                "date_str":     date_str,
+                "actual_start": actual_start,
+                "actual_end":   actual_end,
+                "path":         path,
+            })
+
     return sorted(all_db3_files, key=lambda x: x["actual_start"])
 
 
@@ -113,48 +139,24 @@ def _match_db3_by_time(
     user_hh_start: int, user_mm_start: int, user_ss_start: int,
     user_hh_end: int, user_mm_end: int, user_ss_end: int
 ) -> List[Dict]:
-    """根据用户指定的时间段匹配db3文件（时间范围有交集即匹配）"""
+    """根据用户指定的时间段匹配db3文件（时间范围有交集即匹配）。
+    每个 db3 的精确起止时间已由 sqlite3 查询得到，直接做区间相交判断。
+    """
     matching_files = []
-    target_date = None
-    
+
     for db3 in db3_files:
-        # 构造用户时间段（与当前db3同日期）
-        user_start = datetime(
-            year=db3["actual_start"].year,
-            month=db3["actual_start"].month,
-            day=db3["actual_start"].day,
-            hour=user_hh_start,
-            minute=user_mm_start,
-            second=user_ss_start
-        )
-        user_end = datetime(
-            year=db3["actual_start"].year,
-            month=db3["actual_start"].month,
-            day=db3["actual_start"].day,
-            hour=user_hh_end,
-            minute=user_mm_end,
-            second=user_ss_end
-        )
-        
-        # 只匹配同一日期的文件
-        if target_date is None:
-            target_date = db3["date_str"]
-        elif db3["date_str"] != target_date:
-            continue
-        
-        # 计算db3的结束时间（正常1分钟，或下一包开始时间）
-        db3_end = db3["actual_start"] + timedelta(minutes=1)
-        next_idx = db3_files.index(db3) + 1
-        if next_idx < len(db3_files) and db3_files[next_idx]["date_str"] == target_date:
-            next_start = db3_files[next_idx]["actual_start"]
-            if next_start < db3_end:
-                db3_end = next_start
-        
-        # 时间范围交集判断
-        if db3["actual_start"] < user_end and db3_end > user_start:
+        # 将 HHMMSS 时间构造为与该 db3 同日期的 datetime，便于比较
+        base = db3["actual_start"].date()
+        user_start = datetime(base.year, base.month, base.day,
+                              user_hh_start, user_mm_start, user_ss_start)
+        user_end   = datetime(base.year, base.month, base.day,
+                              user_hh_end,   user_mm_end,   user_ss_end)
+
+        # 区间相交：db3 开始 < 目标结束，且 db3 结束 > 目标开始
+        if db3["actual_start"] < user_end and db3["actual_end"] > user_start:
             matching_files.append(db3)
-    
-    return list({db["path"]: db for db in matching_files}.values())  # 去重
+
+    return matching_files
 
 
 def _create_output_dir(output_root: str, start_time: str, end_time: str) -> str:
@@ -166,31 +168,41 @@ def _create_output_dir(output_root: str, start_time: str, end_time: str) -> str:
     return output_dir
 
 
-def _transfer_db3_files(db3_files: List[Dict], output_dir: str, move_mode: bool) -> Dict[str, str]:
+def _transfer_db3_files(db3_files: List[Dict], output_dir: str, move_mode: bool,
+                        record_path: Optional[str] = None) -> Dict[str, str]:
     """
-    转移db3文件到输出文件夹
-    返回: 移动的文件映射 {目标路径: 原始路径}（仅在移动模式下有效）
+    转移db3文件到输出文件夹。
+    移动模式下，每移动一个文件就立即追加写入记录文件，保证崩溃后可恢复。
+    返回: {目标路径: 原始路径}
     """
     moved_files = {}
     operation = "移动" if move_mode else "复制"
-    
+
+    # 移动模式：预先写入空记录，确保记录文件存在
+    if move_mode and record_path:
+        os.makedirs(os.path.dirname(record_path), exist_ok=True)
+        with open(record_path, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+
     print(f"\n{operation}db3文件：")
     for db3 in db3_files:
         dest_path = os.path.join(output_dir, db3["filename"])
-        
+
         if move_mode:
-            # 移动文件
-            shutil.copy2(db3["path"], dest_path)
-            # 检查移动是否成功
+            shutil.move(db3["path"], dest_path)
             if not os.path.exists(dest_path):
-                raise RuntimeError(f"移动文件失败：源文件 {db3['path']} 已移动，但目标文件 {dest_path} 不存在")
+                raise RuntimeError(f"移动文件失败：目标文件 {dest_path} 不存在")
             moved_files[dest_path] = db3["path"]
-            print(f"  - 已移动：{db3['filename']}（开始时间：{db3['actual_start'].strftime('%H:%M:%S')}）")
+            print(f"  - 已移动：{db3['filename']}（{db3['actual_start'].strftime('%H:%M:%S')}）")
+
+            # 每移动一个文件立即更新记录，防止中途崩溃导致无法恢复
+            if record_path:
+                with open(record_path, 'w', encoding='utf-8') as f:
+                    json.dump(moved_files, f, indent=2, ensure_ascii=False)
         else:
-            # 复制文件
             shutil.copy2(db3["path"], dest_path)
-            print(f"  - 已复制：{db3['filename']}（开始时间：{db3['actual_start'].strftime('%H:%M:%S')}）")
-    
+            print(f"  - 已复制：{db3['filename']}（{db3['actual_start'].strftime('%H:%M:%S')}）")
+
     return moved_files
 
 
@@ -299,13 +311,12 @@ def main():
             output_root_dir=args.output,
             start_time_str=args.start,
             end_time_str=args.end,
-            move_mode=args.move
+            move_mode=args.move,
+            record_path=args.save_record if args.move else None,
         )
-        
-        # 保存移动记录（如果指定了保存路径且确实移动了文件）
+
         if args.move and moved_files and args.save_record:
-            save_move_record(moved_files, args.save_record)
-            print(f"📝 移动记录已保存到：{args.save_record}")
+            print(f"📝 移动记录已实时写入：{args.save_record}")
             
     except Exception as e:
         print(f"执行过程中出现错误：{str(e)}")

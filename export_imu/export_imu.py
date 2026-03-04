@@ -25,7 +25,12 @@ except ImportError as e:
 
 
 # --- 常量 ---
-TARGET_MSG_TYPE = "imu_msgs/msg/Imu" 
+# 支持的 IMU 消息类型（按优先级排序）
+SUPPORTED_MSG_TYPES = [
+    "msg_interfaces/msg/Hcinspvatzcb",  # CHCNAV INS 消息类型（优先）
+    "imu_msgs/msg/Imu",                 # 自定义 IMU 消息类型（包含位置信息）
+    "sensor_msgs/msg/Imu",              # 标准 ROS2 IMU 消息类型（仅姿态）
+]
 
 
 # --- 辅助函数：时间戳转换 (新增) ---
@@ -76,16 +81,23 @@ def convert_latlonalt_to_utm(latitude: float, longitude: float, altitude: float)
 
 
 def convert_rpy_to_quaternion(roll: float, pitch: float, azimuth: float) -> Dict[str, float]:
-    """将欧拉角 (Roll, Pitch, Azimuth/Yaw) 转换为四元数。"""
-    roll_rad = roll
-    pitch_rad = pitch
-    yaw_rad = azimuth 
-    
+    """将欧拉角 (Roll, Pitch, Azimuth/Yaw) 转换为四元数。
+
+    Args:
+        roll: 横滚角（度）
+        pitch: 俯仰角（度）
+        azimuth: 航向角/偏航角（度）
+    """
+    # 将度转换为弧度
+    roll_rad = np.deg2rad(roll)
+    pitch_rad = np.deg2rad(pitch)
+    yaw_rad = np.deg2rad(azimuth)
+
     try:
         # 使用 ZYX 顺序 (Yaw-Pitch-Roll)
         r = R.from_euler('zyx', [yaw_rad, pitch_rad, roll_rad])
         quaternion = r.as_quat() # 返回 (x, y, z, w) 格式
-        
+
         return {
             "quaternion_x": quaternion[0],
             "quaternion_y": quaternion[1],
@@ -94,6 +106,61 @@ def convert_rpy_to_quaternion(roll: float, pitch: float, azimuth: float) -> Dict
         }
     except Exception:
         return {"quaternion_x": None, "quaternion_y": None, "quaternion_z": None, "quaternion_w": None}
+
+
+def extract_imu_data(ins_msg, msg_type: str) -> Dict[str, Any]:
+    """
+    从不同类型的 IMU 消息中提取数据。
+
+    Args:
+        ins_msg: 反序列化后的消息对象
+        msg_type: 消息类型字符串
+
+    Returns:
+        包含 latitude, longitude, altitude, roll, pitch, azimuth 的字典
+    """
+    if msg_type == "msg_interfaces/msg/Hcinspvatzcb":
+        # CHCNAV INS 消息格式
+        return {
+            "latitude": ins_msg.latitude,
+            "longitude": ins_msg.longitude,
+            "altitude": ins_msg.altitude,
+            "roll": ins_msg.roll,
+            "pitch": ins_msg.pitch,
+            "azimuth": ins_msg.yaw,
+        }
+    elif msg_type == "imu_msgs/msg/Imu":
+        # imu_msgs/msg/Imu 消息格式（包含 ASENSING 子消息）
+        return {
+            "latitude": ins_msg.imu_msg.latitude,
+            "longitude": ins_msg.imu_msg.longitude,
+            "altitude": ins_msg.imu_msg.altitude,
+            "roll": ins_msg.imu_msg.roll,
+            "pitch": ins_msg.imu_msg.pitch,
+            "azimuth": ins_msg.imu_msg.azimuth,
+        }
+    elif msg_type == "sensor_msgs/msg/Imu":
+        # 标准 ROS2 IMU 消息格式（只有姿态，没有位置信息）
+        # 从四元数转换为欧拉角
+        quat = [
+            ins_msg.orientation.x,
+            ins_msg.orientation.y,
+            ins_msg.orientation.z,
+            ins_msg.orientation.w,
+        ]
+        r = R.from_quat(quat)
+        euler = r.as_euler('zyx', degrees=True)  # 返回 [yaw, pitch, roll]
+
+        return {
+            "latitude": 0.0,       # sensor_msgs/Imu 不包含位置信息
+            "longitude": 0.0,
+            "altitude": 0.0,
+            "roll": euler[2],      # roll
+            "pitch": euler[1],     # pitch
+            "azimuth": euler[0],   # yaw/azimuth
+        }
+    else:
+        raise ValueError(f"不支持的消息类型: {msg_type}")
 
 
 # --- ROS 2 Bag 解析逻辑 ---
@@ -117,32 +184,36 @@ def process_single_bag(bag_path: str) -> List[Dict[str, Any]]:
     reader = SequentialReader()
     try:
         reader.open(storage_options, converter_options)
-        
-        # 2. 自动检测话题
+
+        # 2. 自动检测话题，查找支持的消息类型
         topics_and_types = reader.get_all_topics_and_types()
-        
+
         target_topic_info = None
+        detected_msg_type = None
         topic_map = {}
-        
+
         for topic_info in topics_and_types:
             try:
                 # 消息类型对象
                 msg_type_obj = get_message(topic_info.type)
                 topic_map[topic_info.name] = (topic_info.type, msg_type_obj)
-                
-                # 找到目标话题的信息
-                if topic_info.type == TARGET_MSG_TYPE:
-                    target_topic_info = topic_info 
+
+                # 按优先级查找支持的消息类型
+                if topic_info.type in SUPPORTED_MSG_TYPES:
+                    if target_topic_info is None or SUPPORTED_MSG_TYPES.index(topic_info.type) < SUPPORTED_MSG_TYPES.index(detected_msg_type):
+                        target_topic_info = topic_info
+                        detected_msg_type = topic_info.type
             except ImportError:
                 # 忽略无法导入的消息类型
                 continue
-        
+
         if not target_topic_info:
-            print(f"❌ 警告: Bag '{bag_path}' 中未找到类型为 '{TARGET_MSG_TYPE}' 的话题。")
+            print(f"❌ 警告: Bag '{bag_path}' 中未找到支持的消息类型。")
+            print(f"   支持的类型: {', '.join(SUPPORTED_MSG_TYPES)}")
             return extracted_data
-            
+
         print(f"✅ 找到目标话题: {target_topic_info.name}, 类型: {target_topic_info.type}")
-        
+
         # 获取目标消息对象
         _, msg_type_obj = topic_map[target_topic_info.name]
 
@@ -156,20 +227,17 @@ def process_single_bag(bag_path: str) -> List[Dict[str, Any]]:
                 continue
 
             try:
-                # 反序列化 Imu 消息
-                imu_msg = deserialize_message(data, msg_type_obj)
-                
-                # 提取 ASENSING 子消息的字段 
-                # 假设 'imu_msgs/msg/Imu' 消息包含一个名为 'imu_msg' 的子字段
-                ins_data = imu_msg.imu_msg 
-                
-                # 提取数据
-                latitude = ins_data.latitude
-                longitude = ins_data.longitude
-                altitude = ins_data.altitude
-                roll = ins_data.roll
-                pitch = ins_data.pitch
-                azimuth = ins_data.azimuth
+                # 反序列化消息
+                ins_msg = deserialize_message(data, msg_type_obj)
+
+                # 使用统一的数据提取函数
+                imu_data = extract_imu_data(ins_msg, detected_msg_type)
+                latitude = imu_data["latitude"]
+                longitude = imu_data["longitude"]
+                altitude = imu_data["altitude"]
+                roll = imu_data["roll"]
+                pitch = imu_data["pitch"]
+                azimuth = imu_data["azimuth"]
 
                 # 5. 执行转换
                 utm_coords = convert_latlonalt_to_utm(latitude, longitude, altitude)
@@ -245,7 +313,7 @@ def main():
     rclpy.init(args=None) # 初始化 rclpy
 
     parser = argparse.ArgumentParser(
-        description=f"解析 ROS 2 bag 文件中的类型为 '{TARGET_MSG_TYPE}' 的 INS 消息，转换为 UTM 坐标和四元数，并输出 JSON 文件。"
+        description=f"解析 ROS 2 bag 文件中的 INS/IMU 消息，转换为 UTM 坐标和四元数，并输出 JSON 文件。支持的消息类型: {', '.join(SUPPORTED_MSG_TYPES)}"
     )
     parser.add_argument(
         "--bag",

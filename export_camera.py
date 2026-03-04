@@ -96,7 +96,7 @@ def create_pipeline(topic_name_sanitized, use_hw_accel="auto"):
         f"appsrc name={topic_name_sanitized} format=time stream-type=stream caps=video/x-h265,stream-format=byte-stream,alignment=au ! "
         f"h265parse config-interval=1 ! {decoder} ! "
         "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink name=sink emit-signals=True max-buffers=10 drop=False sync=false"
+        "appsink name=sink emit-signals=True max-buffers=100 drop=False sync=false"
     )
     return Gst.parse_launch(pipeline_str)
 
@@ -168,16 +168,17 @@ def decode_worker(topic_name, data_queue, base_output_dir, hw_accel_flag, shared
     print(f"[{topic_name}] Worker started. Outputting to: {output_dir}")
 
     main_loop = GLib.MainLoop()
+    eos_received = threading.Event()
     
     # 初始化共享计数器
     if topic_name not in shared_counters:
         shared_counters[topic_name] = {'pushed': 0, 'decoded': 0}
     counters = shared_counters[topic_name]
     
-    # 创建一个最多有16个线程的写入池（原24，可根据CPU调整）
-    writer_pool = ThreadPoolExecutor(max_workers=16)
-    # 创建信号量限制待写入队列长度，防止内存溢出 (50张图片 * 24MB/张 ≈ 1.2GB)
-    semaphore = threading.BoundedSemaphore(value=50)
+    # 创建一个最多有8个线程的写入池（减少并发，避免磁盘I/O瓶颈）
+    writer_pool = ThreadPoolExecutor(max_workers=8)
+    # 创建信号量限制待写入队列长度，防止内存溢出 (200张图片，增加缓冲避免死锁)
+    semaphore = threading.BoundedSemaphore(value=200)
     
     pipeline = create_pipeline(topic_name_sanitized, hw_accel_flag)
     
@@ -191,6 +192,7 @@ def decode_worker(topic_name, data_queue, base_output_dir, hw_accel_flag, shared
         t = message.type
         if t == Gst.MessageType.EOS:
             print(f"\n[{topic_name}] Received EOS from pipeline.")
+            eos_received.set()
             main_loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
@@ -201,9 +203,10 @@ def decode_worker(topic_name, data_queue, base_output_dir, hw_accel_flag, shared
 
     appsrc = pipeline.get_by_name(topic_name_sanitized)
     appsrc.set_property('is-live', False)
-    appsrc.set_property('max-bytes', 0)  # 不缓冲
-    appsrc.set_property('block', True)   # push-buffer 阻塞直到消费
     appsrc.set_property('format', Gst.Format.TIME)
+    # 设置合理的队列大小限制，提供背压
+    appsrc.set_property('max-bytes', 100 * 1024 * 1024)  # 100MB buffer
+    appsrc.set_property('block', True)
 
     pipeline.set_state(Gst.State.PLAYING)
     loop_thread = threading.Thread(target=main_loop.run, daemon=True)
@@ -219,25 +222,34 @@ def decode_worker(topic_name, data_queue, base_output_dir, hw_accel_flag, shared
             buf = Gst.Buffer.new_wrapped(h265_data)
             buf.pts = timestamp  # 设置PTS（纳秒单位，直接赋值）
             buf.dts = Gst.CLOCK_TIME_NONE  # 可选：decode timestamp，通常不需设置
-            appsrc.emit('push-buffer', buf)
+            
+            # push-buffer会阻塞直到pipeline有空间，提供自然的背压
+            ret = appsrc.emit('push-buffer', buf)
+            if ret != Gst.FlowReturn.OK:
+                print(f"[{topic_name}] push-buffer returned {ret}", file=sys.stderr)
+                break
     except Exception as e:
         print(f"[{topic_name}] Error in push loop: {e}", file=sys.stderr)
 
     print(f"[{topic_name}] Sending EOS to appsrc...")
     appsrc.emit('end-of-stream')
 
-    print(f"[{topic_name}] Waiting for pipeline to finish (max 10s)...")
-    loop_thread.join(timeout=10.0)
-
+    print(f"[{topic_name}] Waiting for pipeline to finish processing...")
+    # 等待EOS事件，不设置超时，让pipeline完整处理所有帧
+    eos_received.wait()
+    
+    # 等待主循环线程结束
+    loop_thread.join(timeout=5.0)
     if loop_thread.is_alive():
-        print(f"[{topic_name}] Pipeline did not exit in time. Forcing quit...")
+        print(f"[{topic_name}] Main loop still running, forcing quit...")
         main_loop.quit()
         loop_thread.join(timeout=2.0)
 
+    # 先停止pipeline，防止新的回调触发
+    pipeline.set_state(Gst.State.NULL)
+    
     # 等待所有写入任务完成
     writer_pool.shutdown(wait=True)
-
-    pipeline.set_state(Gst.State.NULL)
     
     print(f"\r[{topic_name}] Finalizing...")
     print(f"--- Summary for Topic: {topic_name} ---")
@@ -353,11 +365,13 @@ def main():
         # 这个 'finally' 块只在所有bag文件都被处理完毕后才会执行
         print("\nEnd of all bag files reached. Signaling worker threads to finalize...")
         for q in data_queues.values(): q.put(None)
-        for t in threads.values(): t.join()
         
-        # 停止监控线程
+        # 停止监控线程（在join之前，避免继续打印）
         monitor.stop()
         monitor.join()
+        
+        # 等待所有worker线程完成
+        for t in threads.values(): t.join()
         
         print(f"\nAll decoding threads have finished. Program terminated. Output is in '{args.out}'")
 
