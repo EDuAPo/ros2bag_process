@@ -42,7 +42,8 @@ MOVE_MODE = True  # 是否使用移动模式（默认True，最节省空间）
 # 4. 新增：检查压缩功能配置
 SKIP_CHECK_COMPRESS = False  # 是否跳过压缩流程（默认不跳过）
 COMPRESS_FORMAT = "zip"  # 压缩格式
-DELETE_RAW_UNDISTORTED = False  # 压缩后是否删除原始 undistorted 目录
+DELETE_RAW_UNDISTORTED = True  # 压缩后是否删除原始 undistorted 目录（建议启用以节省空间）
+DELETE_PREPROCESS_DIR = True  # 压缩后是否删除整个预处理目录（仅保留压缩包）
 
 # 5. 新增：simple.json 清理配置
 CLEAN_BY_SIMPLE_JSON = True  # 是否根据simple.json清理文件
@@ -140,14 +141,23 @@ def get_filter_script_config() -> tuple[str, str]:
     return source_match.group(1).strip(), output_match.group(1).strip()
 
 
-def run_shell_command(command: str, step_name: str) -> dict:
-    """执行命令，实时打印日志，返回执行信息"""
+def run_shell_command(command: str, step_name: str, capture_output: bool = False) -> dict:
+    """执行命令，实时打印日志，返回执行信息
+
+    Args:
+        command: 要执行的命令
+        step_name: 步骤名称
+        capture_output: 是否捕获输出（用于解析返回值）
+
+    Returns:
+        包含执行信息的字典，如果 capture_output=True，还会包含 'output' 字段
+    """
     start_time = time.time()
     print(f"\n{'='*60}")
     print(f"🚀 开始执行：{step_name}")
     print(f"命令：{command}")
     print(f"{'='*60}")
-    
+
     process = subprocess.Popen(
         command,
         shell=True,
@@ -155,17 +165,22 @@ def run_shell_command(command: str, step_name: str) -> dict:
         stderr=subprocess.STDOUT,
         executable=os.environ.get('SHELL', '/bin/bash')
     )
-    
+
+    output_lines = []
     if process.stdout:
         for line in process.stdout:
             try:
-                print(line.decode('utf-8', errors='ignore').strip())
+                decoded_line = line.decode('utf-8', errors='ignore').strip()
             except Exception:
-                print(line.decode(sys.getdefaultencoding(), errors='ignore').strip())
-    
+                decoded_line = line.decode(sys.getdefaultencoding(), errors='ignore').strip()
+
+            print(decoded_line)
+            if capture_output:
+                output_lines.append(decoded_line)
+
     process.wait()
     duration = time.time() - start_time
-    
+
     result = {
         "step_name": step_name,
         "command": command,
@@ -173,14 +188,17 @@ def run_shell_command(command: str, step_name: str) -> dict:
         "duration_seconds": round(duration, 2),
         "status": "success" if process.returncode == 0 else "failed"
     }
-    
+
+    if capture_output:
+        result["output"] = output_lines
+
     if process.returncode != 0:
         print(f"\n❌ 步骤 [{step_name}] 执行失败！错误码：{process.returncode}")
         raise RuntimeError(f"步骤 [{step_name}] 执行失败！错误码：{process.returncode}")
-    
+
     # 优化：强制同步磁盘，防止IO积压导致后续步骤变慢
     subprocess.run("sync", shell=True)
-    
+
     print(f"\n✅ 步骤 [{step_name}] 执行完成！（耗时: {duration:.2f}秒）")
     return result
 
@@ -188,6 +206,31 @@ def run_shell_command(command: str, step_name: str) -> dict:
 def get_filtered_folder_path(output_root: str, start_time: str, end_time: str) -> str:
     """根据你的原有逻辑，计算筛选后的目标文件夹路径"""
     return os.path.join(output_root, f"{start_time}_{end_time}")
+
+
+def get_bag_date(bag_path: str) -> str:
+    """从 bag 文件获取实际数据日期（YYYYMMDD格式）
+
+    Args:
+        bag_path: bag 文件夹路径
+
+    Returns:
+        日期字符串（YYYYMMDD），如果获取失败则返回当前日期
+    """
+    try:
+        from rosbags.highlevel import AnyReader
+        from pathlib import Path
+
+        with AnyReader([Path(bag_path)]) as reader:
+            bag_start_time_ns = reader.start_time
+            bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
+            bag_date = bag_datetime.strftime('%Y%m%d')
+            print(f"📅 从 bag 获取实际数据日期: {bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
+            return bag_date
+    except Exception as e:
+        print(f"⚠️  无法从 bag 获取日期，使用当前日期: {e}")
+        return datetime.now().strftime('%Y%m%d')
+
 
 
 def validate_time_format(time_str: str) -> bool:
@@ -337,14 +380,15 @@ def run_check_and_compress(
     compress_output_dir: str,
     period_idx: int,
     start_time: str,
-    end_time: str
+    end_time: str,
+    bag_path: str = None
 ) -> str:
-    """调用外部检查压缩脚本，执行压缩流程，返回压缩包路径"""
-    # 修改文件名格式：YYYYMMDD_HHMMSS-HHMMSS.zip
-    current_date = datetime.now().strftime('%Y%m%d')
-    compress_filename = f"{current_date}_{start_time}-{end_time}.{COMPRESS_FORMAT}"
+    """调用外部检查压缩脚本，执行压缩流程，返回实际生成的压缩包路径"""
+    # 注意：不在这里生成文件名，让 check_and_compress.py 根据 bag 时间戳生成
+    # 这样可以确保使用实际数据时间而非本地处理时间
+    compress_filename = f"PLACEHOLDER_{start_time}-{end_time}.{COMPRESS_FORMAT}"
     compress_path = os.path.join(compress_output_dir, compress_filename)
-    
+
     check_compress_cmd = (
         f"{sys.executable} {CHECK_COMPRESS_SCRIPT_PATH} "
         f"--undistorted-path {undistorted_path} "
@@ -352,13 +396,33 @@ def run_check_and_compress(
         f"--compress-format {COMPRESS_FORMAT} "
         f"--period {start_time}_{end_time}"
     )
-    
-    run_shell_command(
+
+    # 如果提供了 bag 路径，传递给压缩脚本以获取实际数据时间
+    if bag_path:
+        check_compress_cmd += f" --bag-path {bag_path}"
+
+    result = run_shell_command(
         check_compress_cmd,
-        f"第{period_idx}个时间段 - 步骤4/4：检查+压缩"
+        f"第{period_idx}个时间段 - 步骤4/4：检查+压缩",
+        capture_output=True
     )
-    
-    return compress_path
+
+    # 从输出中解析实际生成的压缩包路径
+    actual_compress_path = None
+    if "output" in result:
+        for line in result["output"]:
+            if "COMPRESS_SUCCESS:" in line:
+                # 提取路径：格式为 "✅ COMPRESS_SUCCESS: /path/to/file.zip"
+                actual_compress_path = line.split("COMPRESS_SUCCESS:")[-1].strip()
+                print(f"📦 实际压缩包路径: {actual_compress_path}")
+                break
+
+    # 如果没有解析到路径，回退到原始路径（但可能不存在）
+    if not actual_compress_path:
+        print(f"⚠️  未能从输出解析压缩包路径，使用预期路径")
+        actual_compress_path = compress_path
+
+    return actual_compress_path
 
 
 def delete_raw_undistorted(undistorted_path: str) -> None:
@@ -369,6 +433,52 @@ def delete_raw_undistorted(undistorted_path: str) -> None:
             print(f"✅ 已删除原始 undistorted 目录：{undistorted_path}")
         except Exception as e:
             print(f"⚠️  删除原始 undistorted 目录失败：{str(e)}")
+
+
+def delete_preprocess_dir(preprocess_dir: str, compress_path: str) -> None:
+    """压缩完成后，删除整个预处理目录，仅保留压缩包
+
+    Args:
+        preprocess_dir: 预处理输出目录（如 20260107_143854_144050/）
+        compress_path: 压缩包路径（应该在 preprocess_dir 内）
+    """
+    if not DELETE_PREPROCESS_DIR:
+        return
+
+    if not os.path.exists(preprocess_dir):
+        print(f"⚠️  预处理目录不存在，无需删除：{preprocess_dir}")
+        return
+
+    # 确保压缩包存在且在预处理目录内
+    if not os.path.exists(compress_path):
+        print(f"⚠️  压缩包不存在，不删除预处理目录：{compress_path}")
+        return
+
+    # 将压缩包移动到预处理目录的父目录
+    try:
+        compress_filename = os.path.basename(compress_path)
+        parent_dir = os.path.dirname(preprocess_dir)
+        new_compress_path = os.path.join(parent_dir, compress_filename)
+
+        # 如果压缩包已经在父目录，直接删除预处理目录
+        if os.path.abspath(compress_path) == os.path.abspath(new_compress_path):
+            print(f"📦 压缩包已在目标位置：{compress_path}")
+        else:
+            # 移动压缩包到父目录
+            shutil.move(compress_path, new_compress_path)
+            print(f"📦 已移动压缩包到：{new_compress_path}")
+
+        # 删除整个预处理目录
+        shutil.rmtree(preprocess_dir)
+        print(f"🗑️  已删除预处理目录：{preprocess_dir}")
+        print(f"✅ 最终产物：{new_compress_path}")
+
+        return new_compress_path
+
+    except Exception as e:
+        print(f"⚠️  清理预处理目录失败：{str(e)}")
+        return compress_path
+
 
 
 def cleanup_by_simple_json(preprocess_out_dir: str, period_idx: int) -> dict:
@@ -488,27 +598,28 @@ def process_single_period(
     
     # 初始化
     filtered_folder = get_filtered_folder_path(output_root, start_time, end_time)
-    preprocess_out_dir = os.path.join(main_out, f"{start_time}_{end_time}")
+    # 先使用临时目录名，等获取到实际日期后再重命名
+    preprocess_out_dir_temp = os.path.join(main_out, f"{start_time}_{end_time}")
     move_record_path = os.path.join("move_records", f"move_record_{start_time}_{end_time}.json")
-    
+
     try:
         # 1. 打印配置信息
         print(f"\n📥 源db3目录：{source_dir}")
         print(f"📤 筛选输出目录：{filtered_folder}")
-        print(f"⚙️  预处理输出目录：{preprocess_out_dir}")
+        print(f"⚙️  预处理输出目录（临时）：{preprocess_out_dir_temp}")
         print(f"🚗 车辆型号：{vehicle}")
         print(f"⏰ 日志时间戳：{logtime}")
-        
+
         # 2. 更新筛选脚本的时间段
         modify_filter_script(start_time, end_time)
-        
+
         # 3. 执行筛选db3文件（使用移动模式）
         print(f"\n🔧 开始筛选步骤...")
-        
+
         # 创建移动记录文件路径
         if MOVE_MODE:
             move_record_path = os.path.join(tempfile.gettempdir(), f"move_{period_idx}_{start_time}_{end_time}.json")
-        
+
         # 构建筛选命令
         filter_cmd = (
             f"{sys.executable} {FILTER_SCRIPT_PATH} "
@@ -517,13 +628,13 @@ def process_single_period(
             f"--start {start_time} "
             f"--end {end_time}"
         )
-        
+
         if MOVE_MODE:
             filter_cmd += f" --move --save-record {move_record_path}"
-        
+
         filter_result = run_shell_command(filter_cmd, f"第{period_idx}个时间段 - 步骤1/4：筛选db3文件")
         period_log["steps"].append(filter_result)
-        
+
         # 4. 检查筛选结果
         if not os.path.exists(filtered_folder):
             print(f"❌ 筛选失败：未生成目标文件夹 {filtered_folder}")
@@ -533,7 +644,12 @@ def process_single_period(
             period_log["duration_seconds"] = round(time.time() - period_start_time, 2)
             period_log["end_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             return period_log
-        
+
+        # 4.5. 从筛选后的 bag 获取实际日期，并确定最终输出目录名
+        bag_date = get_bag_date(filtered_folder)
+        preprocess_out_dir = os.path.join(main_out, f"{bag_date}_{start_time}_{end_time}")
+        print(f"📁 最终输出目录: {preprocess_out_dir}")
+
         # 5. 执行预处理（这一步需要db3文件存在）
         print(f"\n⚙️  开始预处理步骤...")
         run_export_cmd = (
@@ -607,7 +723,8 @@ def process_single_period(
                     compress_output_dir=preprocess_out_dir,
                     period_idx=period_idx,
                     start_time=start_time,
-                    end_time=end_time
+                    end_time=end_time,
+                    bag_path=filtered_folder  # 传递 bag 路径以获取实际数据时间
                 )
                 period_log["steps"].append({
                     "step_name": "检查+压缩",
@@ -616,14 +733,24 @@ def process_single_period(
                     "duration_seconds": round(time.time() - compress_start, 2)
                 })
                 delete_raw_undistorted(undistorted_path)
-        
-        # 10. 打印完成信息
+
+                # 10. 清理预处理目录，仅保留压缩包
+                if compress_path and os.path.exists(compress_path):
+                    final_compress_path = delete_preprocess_dir(preprocess_out_dir, compress_path)
+                    if final_compress_path:
+                        compress_path = final_compress_path
+                        period_log["compress_path"] = final_compress_path
+
+        # 11. 打印完成信息
         print(f"\n✅ 第 {period_idx} 个时间段处理完成！")
-        print(f"   预处理结果：{preprocess_out_dir}")
+        if DELETE_PREPROCESS_DIR:
+            print(f"   最终产物：{compress_path}")
+        else:
+            print(f"   预处理结果：{preprocess_out_dir}")
+            if compress_path and os.path.exists(compress_path):
+                print(f"   压缩包：{compress_path}")
         if MOVE_MODE:
             print(f"   db3文件：已移动并恢复")
-        if compress_path and os.path.exists(compress_path):
-            print(f"   压缩包：{compress_path}")
         
         # 记录成功完成
         period_log["status"] = "success"

@@ -152,9 +152,19 @@ python3 pipline.py \
 
 ## 输出目录结构
 
+默认配置下（`DELETE_PREPROCESS_DIR = True`），流水线完成后只保留最终压缩包：
+
 ```
 pipeline_output/
-└── 143854_144050/              # 时间段目录
+└── 20260107_143854-144050.zip  # 最终产物（日期来自实际数据）
+```
+
+如果设置 `DELETE_PREPROCESS_DIR = False`，则保留完整目录结构：
+
+```
+pipeline_output/
+└── 20260107_143854_144050/    # 格式：YYYYMMDD_HHMMSS_HHMMSS（日期来自实际数据）
+    ├── 20260107_143854-144050.zip  # 压缩包（日期来自实际数据）
     └── undistorted/            # 最终输出目录
         ├── ins.json            # IMU数据
         ├── sample.json         # 采样信息
@@ -175,6 +185,8 @@ pipeline_output/
         ├── iv_points_rear_left/
         └── iv_points_rear_right/
 ```
+
+**注意：** 目录名和压缩包名中的日期（YYYYMMDD）来自实际 bag 数据的时间戳，而不是本地处理时间。
 
 ## 运行前检查清单
 

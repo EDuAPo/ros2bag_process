@@ -382,42 +382,56 @@ class FolderCompressor:
             try:
                 with AnyReader([Path(self.bag_path)]) as reader:
                     bag_start_time_ns = reader.start_time
-                    bag_date = datetime.fromtimestamp(bag_start_time_ns / 1e9).strftime('%Y%m%d')
-                    print(f"📅 使用 bag 时间戳作为日期: {bag_date}")
+                    bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
+                    bag_date = bag_datetime.strftime('%Y%m%d')
+                    print(f"📅 使用 bag 实际数据时间作为日期: {bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
             except Exception as e:
                 print(f"⚠️ 无法从 bag 获取时间戳，使用当前日期: {e}")
                 bag_date = datetime.now().strftime('%Y%m%d')
         else:
+            if not self.bag_path:
+                print(f"⚠️ 未提供 bag 路径，使用当前日期")
             bag_date = datetime.now().strftime('%Y%m%d')
-        
+
         if output_path:
             zip_path = Path(output_path)
+            # 如果文件名包含 PLACEHOLDER，替换为实际日期
+            if 'PLACEHOLDER' in zip_path.name:
+                # 提取时间段部分（HHMMSS-HHMMSS）
+                import re
+                time_pattern = r'(\d{6}-\d{6})'
+                match = re.search(time_pattern, zip_path.name)
+                if match:
+                    time_range = match.group(1)
+                    new_filename = f"{bag_date}_{time_range}.zip"
+                    zip_path = zip_path.parent / new_filename
+                    print(f"📝 压缩文件名: {new_filename}")
             zip_filename = zip_path.name
         else:
             # 压缩包保存到root_dir下，添加日期前缀
             zip_filename = f"{bag_date}_{target_folder_path.name}.zip"
             zip_path = self.root_dir / zip_filename
-        
+
         # 如果压缩包已存在，直接覆盖（无需确认）
         if zip_path.exists():
             print(f"  ⚠️  压缩包 {zip_filename} 已存在，将直接覆盖")
             zip_path.unlink()  # 删除已存在的压缩包
-        
+
         try:
             print(f"  📦 开始压缩文件夹（仅包含 '{self.keep_folder_name}' 目录）...")
             skipped_files = 0
             compressed_files = 0
-            
+
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, dirs, files in os.walk(target_folder_path):
                     for file in files:
                         file_path = Path(root) / file
-                        
+
                         # 检查文件是否存在（可能被cleanup删除）
                         if not file_path.exists():
                             skipped_files += 1
                             continue
-                        
+
                         try:
                             # 在ZIP文件中保持相对路径（相对于root_dir）
                             try:
@@ -425,7 +439,7 @@ class FolderCompressor:
                             except ValueError:
                                 # 如果不在root_dir下（例如单文件夹模式），则相对于target_folder_path的父目录
                                 arcname = file_path.relative_to(target_folder_path.parent)
-                            
+
                             zipf.write(file_path, arcname)
                             compressed_files += 1
                         except FileNotFoundError:
@@ -436,25 +450,26 @@ class FolderCompressor:
                             print(f"  ⚠️  跳过文件 {file_path.name}: {str(e)}")
                             skipped_files += 1
                             continue
-            
+
             # 检查压缩包大小
             zip_size_bytes = zip_path.stat().st_size
             zip_size_formatted = self.format_file_size(zip_size_bytes)
-            
+
             print(f"  ✅ 压缩完成: {zip_filename}")
             print(f"  📊 压缩包大小: {zip_size_formatted}")
-            
+            print(f"  📍 压缩包路径: {zip_path}")
+
             # 如果小于最小配置大小，给出警告
             if zip_size_bytes < self.min_zip_size_bytes:
                 print(f"  ⚠️  警告: 压缩包大小小于 {self.min_zip_size_gb}GB，可能存在数据不完整！")
-            
-            return True
+
+            return str(zip_path)  # 返回实际生成的压缩包路径
         except Exception as e:
             print(f"  ❌ 压缩失败: {e}")
             # 如果压缩失败且文件已创建，删除不完整的压缩包
             if zip_path.exists():
                 zip_path.unlink()
-            return False
+            return None
     
     def is_time_format_folder(self, folder_name):
         """判断文件夹名是否为时间格式（HHMMSS_HHMMSS）"""
@@ -462,16 +477,16 @@ class FolderCompressor:
         return bool(re.match(pattern, folder_name))
     
     def process_single_undistorted_folder(self, undistorted_path, compress_path):
-        """处理单个undistorted文件夹（Pipeline模式）"""
+        """处理单个undistorted文件夹（Pipeline模式），返回实际生成的压缩包路径"""
         target_folder = Path(undistorted_path)
         print(f"\n📂 正在处理单个文件夹: {target_folder}")
         print("-" * 50)
-        
+
         # 检查磁盘空间 (检查压缩包所在目录)
         compress_dir = Path(compress_path).parent
         if not compress_dir.exists():
             compress_dir.mkdir(parents=True, exist_ok=True)
-            
+
         print(f"\n📊 正在检查磁盘空间 (目标: {compress_dir})...")
         free_space = self.get_free_disk_space(compress_dir)
         if free_space >= 0:
@@ -479,29 +494,31 @@ class FolderCompressor:
             print(f"  📈 磁盘剩余空间: {free_space_gb:.2f} GB")
             if free_space < self.required_free_space_bytes:
                 print(f"  ❌ 磁盘空间不足！所需: {self.required_free_space_gb} GB")
-                return False
-        
+                return None
+
         # 执行检查
         checks_passed = True
-        
+
         # 检查1: JSON文件
         if not self.check_json_files(target_folder):
             checks_passed = False
-        
+
         # 检查2: 文件夹结构
         if not self.check_folder_structure(target_folder):
             checks_passed = False
-            
+
         if checks_passed:
             print(f" 所有检查通过，开始压缩...")
             # 注意：Pipeline模式下不执行 clean_folder_before_compress，由Pipeline脚本负责清理
-            
-            if self.compress_folder(target_folder, output_path=compress_path):
-                return True
+
+            actual_compress_path = self.compress_folder(target_folder, output_path=compress_path)
+            if actual_compress_path:
+                print(f"✅ 压缩成功: {actual_compress_path}")
+                return actual_compress_path
         else:
             print(f"  ❌ 检查未通过，跳过压缩")
-            
-        return False
+
+        return None
 
     def process_all_target_folders(self):
         """处理root_dir下所有时间格式的子文件夹"""
@@ -574,16 +591,22 @@ def main():
     parser.add_argument("--compress-format", type=str, default="zip", help="压缩格式")
     parser.add_argument("--period", type=str, help="时间段标识")
     parser.add_argument("--bag-path", type=str, help="ROS2 bag 路径，用于获取时间戳作为压缩文件名日期")
-    
+
     args, unknown = parser.parse_known_args()
-    
+
     if args.undistorted_path and args.compress_path:
         # Pipeline模式
         print("🚀 启动 Pipeline 单文件夹处理模式")
         # root_dir 设置为 undistorted_path 的父目录，以便计算相对路径
         root_dir = Path(args.undistorted_path).parent
         compressor = FolderCompressor(root_dir, args.bag_path)
-        compressor.process_single_undistorted_folder(args.undistorted_path, args.compress_path)
+        actual_compress_path = compressor.process_single_undistorted_folder(args.undistorted_path, args.compress_path)
+
+        # 输出实际生成的压缩包路径，供 pipline.py 读取
+        if actual_compress_path:
+            print(f"\n✅ COMPRESS_SUCCESS: {actual_compress_path}")
+        else:
+            print(f"\n❌ COMPRESS_FAILED")
         return
 
     print("📁 文件夹批量压缩工具（基于undistorted目录 + 自动清理 + 无确认 + 磁盘空间检查）")
@@ -592,10 +615,10 @@ def main():
     print(f"⚠️  要求：目标目录剩余空间需大于 50 GB")
     print(f"⚠️  说明：所有数据检查均基于 'undistorted' 子目录")
     print("=" * 60)
-    
+
     # 根目录：包含所有时间格式子文件夹的目录
     root_dir = "/media/zgw/T7/0209out/"
-    
+
     # 创建压缩器实例并处理
     compressor = FolderCompressor(root_dir, args.bag_path)
     compressor.process_all_target_folders()
