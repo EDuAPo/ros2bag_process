@@ -21,7 +21,7 @@ CHECK_AND_COMPRESS_SCRIPT = os.path.join(CURRENT_DIR, "check_and_compress.py")
 def load_config() -> Dict[str, Any]:
     """从 config.yaml 加载配置"""
     if not os.path.exists(CONFIG_FILE):
-        print(f"❌ 错误: 配置文件不存在: {CONFIG_FILE}", file=sys.stderr)
+        print(f"  [FAIL] 配置文件不存在: {CONFIG_FILE}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -29,7 +29,7 @@ def load_config() -> Dict[str, Any]:
             config = yaml.safe_load(f)
         return config
     except Exception as e:
-        print(f"❌ 错误: 无法读取配置文件 {CONFIG_FILE}: {e}", file=sys.stderr)
+        print(f"  [FAIL] 无法读取配置文件: {e}", file=sys.stderr)
         sys.exit(1)
 
 def get_shell_setup_command(config: Dict[str, Any]) -> str:
@@ -69,29 +69,23 @@ def run_command(command: List[str], step_name: str, use_shell: bool = False):
     """
     执行一个外部命令，并在失败时退出。
     """
-    print(f"\n--- 🚀 开始执行步骤: {step_name} ---")
-    
+    print(f"\n  >> {step_name}")
+
     if use_shell:
         full_command = command[0]
-        print(f"命令: {full_command}")
     else:
-        # Note: 此时我们只在 shell=True 时使用此函数，因此此分支可能很少被执行。
         full_command = command
-        print(f"命令: {' '.join(full_command)}")
 
     try:
-        # 在 shell=True 模式下，我们必须指定 executable 为当前 shell，以确保 source 命令生效
         subprocess.run(full_command, check=True, text=True, shell=use_shell, executable=os.environ.get('SHELL', '/bin/bash'))
-        print(f"--- ✅ 步骤 {step_name} 执行成功。 ---")
+        print(f"  [OK] {step_name}")
     except subprocess.CalledProcessError as e:
-        print(f"--- ❌ 步骤 {step_name} 执行失败！ ---", file=sys.stderr)
-        print(f"错误码: {e.returncode}", file=sys.stderr)
-        print(f"Stdout:\n{e.stdout}", file=sys.stderr)
-        print(f"Stderr:\n{e.stderr}", file=sys.stderr)
+        print(f"  [FAIL] {step_name} (错误码: {e.returncode})", file=sys.stderr)
+        if e.stderr:
+            print(f"    stderr: {e.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     except FileNotFoundError:
-        print(f"--- ❌ 步骤 {step_name} 执行失败！ ---", file=sys.stderr)
-        print(f"错误: 找不到脚本或命令。请检查路径。", file=sys.stderr)
+        print(f"  [FAIL] {step_name} - 找不到脚本或命令", file=sys.stderr)
         sys.exit(1)
 
 
@@ -99,29 +93,23 @@ def adjust_directories(export_dir: str, undistorted_dir: str):
     """
     步骤 5: 调整目录结构，将 iv_points* 和 ins.json 移动到最终的 undistorted 目录。
     """
-    print("\n--- 🚀 开始执行步骤: [Export Step 5/6] 调整目录结构 (移动文件) ---")
-    
+    print(f"\n  >> [Export Step 5/6] 调整目录结构")
+
     files_to_move = []
     try:
-        # 查找 iv_points* 和 ins.json
         for item in os.listdir(export_dir):
             if item.startswith("iv_points") or item == "ins.json":
                 files_to_move.append(item)
-                
-        if not files_to_move:
-            print("警告: 未找到 iv_points* 或 ins.json 文件进行移动。")
-            
+
         for filename in files_to_move:
             src = os.path.join(export_dir, filename)
             dst = os.path.join(undistorted_dir, filename)
             shutil.move(src, dst)
-            print(f"  移动: {filename}")
-            
-        print("--- ✅ 步骤 [Export Step 5/6] 目录调整执行成功。 ---")
+
+        print(f"  [OK] 目录调整完成, 移动 {len(files_to_move)} 项")
 
     except Exception as e:
-        print(f"--- ❌ 步骤 [Export Step 5/6] 目录调整执行失败！ ---", file=sys.stderr)
-        print(f"错误: {e}", file=sys.stderr)
+        print(f"  [FAIL] 目录调整失败: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -152,6 +140,10 @@ def main():
                         type=str,
                         required=False,
                         help="指定日志时间戳（可选，默认从 config.yaml 读取）")
+    parser.add_argument("--start-time", type=str, help="开始时间 (HHMMSS 格式)")
+    parser.add_argument("--end-time", type=str, help="结束时间 (HHMMSS 格式)")
+    parser.add_argument("--skip-compress", action="store_true",
+                        help="跳过压缩步骤（由 pipline.py 调度时使用，避免重复压缩）")
 
     args = parser.parse_args()
 
@@ -177,28 +169,20 @@ def main():
     os.makedirs(EXPORT_DIR, exist_ok=True)
     os.makedirs(UNDISTORTED_DIR, exist_ok=True)
 
-    print(f"🎬 流程开始")
-    print(f"  输入 Bag: {INPUT_BAG_DIR}")
-    print(f"  输出目录: {MAIN_OUTPUT_DIR}")
-    print(f"  车辆型号: {VEHICLE_MODEL}")
-    print(f"  日志时间: {LOGTIME}")
-    print(f"  缩放比例: {SCALE_MIN}")
+    print(f"  预处理流程启动: bag={INPUT_BAG_DIR}")
+    print(f"    输出: {MAIN_OUTPUT_DIR} | 车辆: {VEHICLE_MODEL} | 缩放: {SCALE_MIN}")
 
     # 获取 shell setup 命令
     SHELL_SETUP_COMMAND = get_shell_setup_command(config)
-    print(f"  IMU 消息包已配置")
 
-
-    # =================================================================
-    # 流程主线开始
-    # =================================================================
-    
     # --- 1. 导出 Camera 图像 ---
     camera_command_string = (
         f"{sys.executable} {EXPORT_CAMERA_SCRIPT} "
         f"--bag {INPUT_BAG_DIR} "
         f"--out {EXPORT_DIR}"
     )
+    if args.start_time and args.end_time:
+        camera_command_string += f" --start-time {args.start_time} --end-time {args.end_time}"
     run_command([camera_command_string], "[Export Step 1/6] 导出 Camera 图像", use_shell=True)
 
     # --- 2. 导出 Lidar 点云 ---
@@ -208,6 +192,8 @@ def main():
         f"--out {EXPORT_DIR} "
         f"--format {LIDAR_FORMAT}"
     )
+    if args.start_time and args.end_time:
+        lidar_command_string += f" --start-time {args.start_time} --end-time {args.end_time}"
     run_command([lidar_command_string], "[Export Step 2/6] 导出 Lidar 点云", use_shell=True)
     
     # --- 3. 导出 IMU/INS 数据 (需要 source) ---
@@ -242,16 +228,17 @@ def main():
     run_command([extract_command_string], "[Export Step 6/6] 提取样本", use_shell=True)
 
     # --- 7. 压缩数据 (可选，使用 bag 时间戳作为日期) ---
-    compress_command_string = (
-        f"{sys.executable} {CHECK_AND_COMPRESS_SCRIPT} "
-        f"--undistorted-path {UNDISTORTED_DIR} "
-        f"--bag-path {INPUT_BAG_DIR}"
-    )
-    run_command([compress_command_string], "[Export Step 7/7] 压缩数据", use_shell=True)
+    if args.skip_compress:
+        print("\n  [SKIP] 压缩步骤（由上层调度脚本负责）")
+    else:
+        compress_command_string = (
+            f"{sys.executable} {CHECK_AND_COMPRESS_SCRIPT} "
+            f"--undistorted-path {UNDISTORTED_DIR} "
+            f"--bag-path {INPUT_BAG_DIR}"
+        )
+        run_command([compress_command_string], "[Export Step 7/7] 压缩数据", use_shell=True)
 
-    print("\n\n🎉🎉🎉 预处理导出阶段完成 (7个内部步骤已执行) 🎉🎉🎉")
-    print(f"最终数据位于: {UNDISTORTED_DIR}")
-    print(f"压缩包将自动生成在 {MAIN_OUTPUT_DIR} 下，使用 bag 日期作为前缀")
+    print(f"\n  [OK] 预处理导出阶段完成 -> {UNDISTORTED_DIR}")
 
 
 if __name__ == "__main__":

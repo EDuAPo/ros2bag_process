@@ -312,8 +312,18 @@ class TopicExporter(threading.Thread):
             print(f"  > 4. Save File ({self.export_format.upper()}): {time_save_file:.2f}ms")
 
 
-# --- 核心函数：统一读取并分发消息 (保持不变) ---
-def export_one_bag(bag_path, out_dir, export_format):
+# --- 核心函数：统一读取并分发消息 ---
+def export_one_bag(bag_path, out_dir, export_format, start_time_ns=None, end_time_ns=None):
+    """
+    导出 bag 中的激光雷达数据
+
+    Args:
+        bag_path: bag 文件路径
+        out_dir: 输出目录
+        export_format: 导出格式
+        start_time_ns: 开始时间（纳秒时间戳），None 表示不限制
+        end_time_ns: 结束时间（纳秒时间戳），None 表示不限制
+    """
     # 1. 识别 PointCloud2 Topics
     topics, topic_types_str, topics_meta = list_pointcloud2_topics(bag_path)
     if not topics:
@@ -362,10 +372,13 @@ def export_one_bag(bag_path, out_dir, export_format):
 
     # 4. 主线程：读取并投递消息
     print("\n[INFO] 主线程开始读取数据并分发...")
-    
+    if start_time_ns is not None and end_time_ns is not None:
+        print(f"[INFO] 时间范围过滤: {start_time_ns} - {end_time_ns} (纳秒)")
+
     total_messages_read = 0
+    total_messages_filtered = 0
     total_read_time = 0.0
-    
+
     with tqdm(total=total_messages_to_export, desc="Reading and Dispatching", ncols=100) as pbar_read:
         while reader.has_next():
             start_time = datetime.now()
@@ -374,11 +387,17 @@ def export_one_bag(bag_path, out_dir, export_format):
             read_time = (datetime.now() - start_time).total_seconds() * 1000 # ms
             total_read_time += read_time
             total_messages_read += 1
-            
+
+            # 时间范围过滤
+            if start_time_ns is not None and end_time_ns is not None:
+                if t < start_time_ns or t > end_time_ns:
+                    total_messages_filtered += 1
+                    continue
+
             if topic in topic_queues:
-                topic_queues[topic].put((data, t)) 
+                topic_queues[topic].put((data, t))
                 pbar_read.update(1)
-            
+
             # 打印主线程读取耗时 (仅对前几帧或定期打印)
             if total_messages_read <= 5 or total_messages_read % 100 == 0:
                  print(f"[LOG] Main Thread Read Frame {total_messages_read} | Read/Dispatch Time: {read_time:.2f}ms")
@@ -386,6 +405,8 @@ def export_one_bag(bag_path, out_dir, export_format):
     # 5. 发送停止信号并等待所有线程完成
     avg_read_time = total_read_time / total_messages_read if total_messages_read > 0 else 0
     print(f"\n[INFO] 主线程读取完成，总读取消息 {total_messages_read} 帧。平均读取耗时: {avg_read_time:.2f}ms")
+    if start_time_ns is not None and end_time_ns is not None:
+        print(f"[INFO] 时间过滤：过滤掉 {total_messages_filtered} 帧，保留 {total_messages_read - total_messages_filtered} 帧")
     for topic, q in topic_queues.items():
         q.put(STOP_SIGNAL)
 
@@ -394,23 +415,77 @@ def export_one_bag(bag_path, out_dir, export_format):
 
     print(f"\n✅ Bag {bag_path} 所有 PointCloud2 Topics 导出完成！")
 
-    
-# --- Main 函数 (保持不变) ---
+
+# --- Main 函数 ---
 def main():
     parser = argparse.ArgumentParser(description="多线程导出多个 ROS2 bag 的 Lidar 数据")
     parser.add_argument("--bag", required=True, help="ROS2 bag 目录（可以是单个bag目录或包含多个bag子目录的根目录）")
     parser.add_argument("--out", required=True, help="输出根目录")
     parser.add_argument(
-        "--format", 
-        required=True, 
-        choices=['pcd_ascii', 'pcd_binary', 'bin'], 
-        help="导出格式: pcd_ascii, pcd_binary (PCD格式的ASCII/二进制), 或 bin (原始二进制 float32)"
+        "--format",
+        default='pcd_binary',
+        choices=['pcd_ascii', 'pcd_binary', 'bin'],
+        help="导出格式: pcd_ascii, pcd_binary (PCD格式的ASCII/二进制), 或 bin (原始二进制 float32)。默认: pcd_binary"
     )
+    parser.add_argument("--start-time", type=str, help="开始时间 (HHMMSS 格式)")
+    parser.add_argument("--end-time", type=str, help="结束时间 (HHMMSS 格式)")
     args = parser.parse_args()
 
     bag_root = os.path.abspath(args.bag)
     out_root = os.path.abspath(args.out)
     export_format = args.format.lower()
+
+    # 解析时间参数
+    start_time_ns = None
+    end_time_ns = None
+    if args.start_time and args.end_time:
+        try:
+            # 从 bag 获取日期
+            from rosbags.highlevel import AnyReader
+            from pathlib import Path
+
+            # 先找到第一个 bag 目录来获取日期
+            temp_bag_path = args.bag
+            if not os.path.exists(os.path.join(temp_bag_path, "metadata.yaml")):
+                # 如果不是 bag 目录，尝试找第一个子目录
+                for entry in sorted(os.listdir(temp_bag_path)):
+                    candidate = os.path.join(temp_bag_path, entry)
+                    if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "metadata.yaml")):
+                        temp_bag_path = candidate
+                        break
+
+            with AnyReader([Path(temp_bag_path)]) as reader:
+                bag_start_time_ns = reader.start_time
+                bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
+                bag_date = bag_datetime.date()
+
+                # 解析用户时间 (HHMMSS)
+                start_hh = int(args.start_time[:2])
+                start_mm = int(args.start_time[2:4])
+                start_ss = int(args.start_time[4:6])
+                end_hh = int(args.end_time[:2])
+                end_mm = int(args.end_time[2:4])
+                end_ss = int(args.end_time[4:6])
+
+                # 构造完整的 datetime
+                start_dt = datetime.combine(bag_date, datetime.min.time()).replace(
+                    hour=start_hh, minute=start_mm, second=start_ss
+                )
+                end_dt = datetime.combine(bag_date, datetime.min.time()).replace(
+                    hour=end_hh, minute=end_mm, second=end_ss
+                )
+
+                # 转换为纳秒时间戳
+                start_time_ns = int(start_dt.timestamp() * 1e9)
+                end_time_ns = int(end_dt.timestamp() * 1e9)
+
+                print(f"⏰ 时间范围过滤: {args.start_time} - {args.end_time}")
+                print(f"   转换为: {start_dt} - {end_dt}")
+                print(f"   纳秒时间戳: {start_time_ns} - {end_time_ns}")
+        except Exception as e:
+            print(f"⚠️  警告: 无法解析时间参数，将导出所有数据: {e}")
+            start_time_ns = None
+            end_time_ns = None
 
     # 检查输入路径是否存在
     if not os.path.exists(bag_root):
@@ -483,7 +558,7 @@ def main():
         os.makedirs(bag_out_dir, exist_ok=True)
 
         # 调用导出函数
-        export_one_bag(bag_path, bag_out_dir, export_format)
+        export_one_bag(bag_path, bag_out_dir, export_format, start_time_ns, end_time_ns)
 
     print("\n" + "="*80)
     print("✅ 所有 bag 导出完成！")

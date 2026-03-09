@@ -48,7 +48,7 @@ def copy_rosbag_files(source_dir: str, output_root_dir: str, start_time_str: str
         user_hh_end, user_mm_end, user_ss_end
     )
     if not matching_db3_files:
-        print(f"未找到与时间段 {start_time_str} - {end_time_str} 有交集的db3文件")
+        print(f"  [WARN] 未找到与时间段 {start_time_str}-{end_time_str} 有交集的db3文件")
         return {}
 
     # 3. 创建输出文件夹并转移db3文件（移动模式下实时写入记录）
@@ -59,7 +59,7 @@ def copy_rosbag_files(source_dir: str, output_root_dir: str, start_time_str: str
     _generate_yaml_by_ros2_compatible(output_dir)
 
     operation = "移动" if move_mode else "复制"
-    print(f"\n操作完成！共{operation} {len(matching_db3_files)} 个db3文件，并生成标准 metadata.yaml 到 {output_dir}")
+    print(f"  筛选完成: {operation} {len(matching_db3_files)} 个db3文件 -> {output_dir}")
 
     return moved_files
 
@@ -86,15 +86,14 @@ def _query_db3_time_range(db3_path: str):
     返回 (min_ns, max_ns)，失败返回 (None, None)。
     """
     try:
-        conn = sqlite3.connect(db3_path)
-        cur = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM messages")
-        tmin, tmax = cur.fetchone()
-        conn.close()
+        with sqlite3.connect(db3_path) as conn:
+            cur = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM messages")
+            tmin, tmax = cur.fetchone()
         if tmin is None or tmax is None:
             return None, None
         return int(tmin), int(tmax)
     except Exception as e:
-        print(f"警告：读取 {os.path.basename(db3_path)} 时间范围失败：{e}")
+        print(f"  [WARN] 读取 {os.path.basename(db3_path)} 时间范围失败: {e}")
         return None, None
 
 
@@ -117,7 +116,6 @@ def _find_and_parse_db3_files(source_dir: str) -> List[Dict]:
 
             tmin_ns, tmax_ns = _query_db3_time_range(path)
             if tmin_ns is None:
-                print(f"警告：跳过无法读取时间的文件 {filename}")
                 continue
 
             actual_start = datetime.fromtimestamp(tmin_ns / 1e9)
@@ -164,7 +162,6 @@ def _create_output_dir(output_root: str, start_time: str, end_time: str) -> str:
     output_dir_name = f"{start_time}_{end_time}"
     output_dir = os.path.join(output_root, output_dir_name)
     os.makedirs(output_dir, exist_ok=True)
-    print(f"输出文件夹已创建：{output_dir}")
     return output_dir
 
 
@@ -184,7 +181,6 @@ def _transfer_db3_files(db3_files: List[Dict], output_dir: str, move_mode: bool,
         with open(record_path, 'w', encoding='utf-8') as f:
             json.dump({}, f)
 
-    print(f"\n{operation}db3文件：")
     for db3 in db3_files:
         dest_path = os.path.join(output_dir, db3["filename"])
 
@@ -193,7 +189,6 @@ def _transfer_db3_files(db3_files: List[Dict], output_dir: str, move_mode: bool,
             if not os.path.exists(dest_path):
                 raise RuntimeError(f"移动文件失败：目标文件 {dest_path} 不存在")
             moved_files[dest_path] = db3["path"]
-            print(f"  - 已移动：{db3['filename']}（{db3['actual_start'].strftime('%H:%M:%S')}）")
 
             # 每移动一个文件立即更新记录，防止中途崩溃导致无法恢复
             if record_path:
@@ -201,7 +196,9 @@ def _transfer_db3_files(db3_files: List[Dict], output_dir: str, move_mode: bool,
                     json.dump(moved_files, f, indent=2, ensure_ascii=False)
         else:
             shutil.copy2(db3["path"], dest_path)
-            print(f"  - 已复制：{db3['filename']}（{db3['actual_start'].strftime('%H:%M:%S')}）")
+
+    time_range = f"{db3_files[0]['actual_start'].strftime('%H:%M:%S')}-{db3_files[-1]['actual_end'].strftime('%H:%M:%S')}"
+    print(f"  {operation} {len(db3_files)} 个db3文件 ({time_range})")
 
     return moved_files
 
@@ -214,7 +211,7 @@ def _generate_yaml_by_ros2_compatible(output_dir: str):
     yaml_path = os.path.join(output_dir, yaml_filename)
     bag_folder_path = output_dir
     
-    print(f"\n正在通过ROS 2生成 {yaml_filename}...")
+    print(f"  生成 metadata.yaml...")
     try:
         result = subprocess.run(
             f"ros2 bag reindex {bag_folder_path} --storage sqlite3",
@@ -231,8 +228,6 @@ def _generate_yaml_by_ros2_compatible(output_dir: str):
         
         # 清理yaml格式
         _clean_yaml_format(yaml_path)
-        
-        print(f"成功生成标准metadata.yaml：{yaml_path}")
     
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.strip() or "未知错误"
@@ -265,20 +260,16 @@ def _clean_yaml_format(yaml_path: str):
 
 def save_move_record(moved_files: Dict[str, str], record_path: str):
     """保存移动记录到JSON文件，并验证文件是否存在"""
-    print(f"📝 正在保存移动记录到：{record_path}")
-    print(f"   移动了 {len(moved_files)} 个文件")
-    
     # 验证所有移动的文件都存在
     for dest_path, src_path in moved_files.items():
         if not os.path.exists(dest_path):
-            print(f"⚠️  警告：移动记录中的目标文件不存在：{dest_path}")
-    
+            print(f"  [WARN] 移动记录中的目标文件不存在: {dest_path}")
+
     try:
         with open(record_path, 'w', encoding='utf-8') as f:
             json.dump(moved_files, f, indent=2, ensure_ascii=False)
-        print(f"✅ 移动记录保存成功")
     except Exception as e:
-        print(f"❌ 移动记录保存失败：{str(e)}")
+        print(f"  [FAIL] 移动记录保存失败: {e}")
         raise
 
 
@@ -316,10 +307,10 @@ def main():
         )
 
         if args.move and moved_files and args.save_record:
-            print(f"📝 移动记录已实时写入：{args.save_record}")
+            print(f"  移动记录已写入: {args.save_record}")
             
     except Exception as e:
-        print(f"执行过程中出现错误：{str(e)}")
+        print(f"执行过程中出现错误: {e}")
         sys.exit(1)
 
 

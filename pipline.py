@@ -7,6 +7,9 @@ import shutil
 import json
 import tempfile
 import time
+import signal
+import atexit
+import gc
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Set
 
@@ -17,6 +20,11 @@ try:
 except ImportError:
     USE_UNIFIED_CONFIG = False
     global_config = None
+
+# ===================== 全局状态管理 =====================
+# 用于跟踪所有移动记录文件，确保异常退出时能恢复
+ACTIVE_MOVE_RECORDS = []  # 存储所有活跃的移动记录文件路径
+CLEANUP_REGISTERED = False  # 标记是否已注册清理函数
 
 # ===================== 配置区域 =====================
 # 1. 核心脚本路径
@@ -58,6 +66,136 @@ PIPELINE_LOG = {
 SESSION_START_TIME = 0  # 会话开始时间
 # ===================================================
 
+def fmt_time(seconds: float) -> str:
+    """将秒数格式化为可读时间字符串"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s}s"
+    else:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m}m{s}s"
+
+
+def log_header(msg: str, level: int = 1) -> None:
+    """打印分级标题
+    level 1: 会话级（双线）  level 2: 时间段级（单线）  level 3: 步骤级（短线）
+    """
+    width = 72
+    if level == 1:
+        print(f"\n{'='*width}")
+        print(f"  {msg}")
+        print(f"{'='*width}")
+    elif level == 2:
+        print(f"\n{'─'*width}")
+        print(f"  {msg}")
+        print(f"{'─'*width}")
+    else:
+        print(f"\n  ── {msg}")
+
+
+def log_kv(key: str, value: str, indent: int = 4) -> None:
+    """打印 key: value 对"""
+    print(f"{' '*indent}{key}: {value}")
+
+
+def log_ok(msg: str) -> None:
+    print(f"  [OK] {msg}")
+
+
+def log_fail(msg: str) -> None:
+    print(f"  [FAIL] {msg}")
+
+
+def log_warn(msg: str) -> None:
+    print(f"  [WARN] {msg}")
+
+
+def log_skip(msg: str) -> None:
+    print(f"  [SKIP] {msg}")
+
+
+def emergency_cleanup():
+    """紧急清理函数：在程序异常退出时恢复所有移动的文件"""
+    if not ACTIVE_MOVE_RECORDS:
+        return
+
+    log_header("!! 异常退出 - 正在恢复db3文件 !!", level=1)
+
+    total_restored = 0
+    total_failed = 0
+
+    for record_path in ACTIVE_MOVE_RECORDS:
+        if not os.path.exists(record_path):
+            continue
+
+        try:
+            success, total = restore_moved_files(record_path)
+            total_restored += success
+            total_failed += (total - success)
+        except Exception as e:
+            log_fail(f"恢复失败: {e}")
+            total_failed += 1
+
+    print(f"\n  紧急恢复完成: 成功 {total_restored}, 失败 {total_failed}")
+
+def signal_handler(signum, frame):
+    """信号处理器：捕获Ctrl+C等中断信号"""
+    signal_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+    print(f"\n\n  收到 {signal_name} 信号，正在安全退出...")
+    emergency_cleanup()
+    sys.exit(1)
+
+def register_cleanup_handlers():
+    """注册清理处理器（只注册一次）"""
+    global CLEANUP_REGISTERED
+    if CLEANUP_REGISTERED:
+        return
+
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill命令
+
+    # 注册atexit处理器（正常退出时也检查）
+    atexit.register(emergency_cleanup)
+
+    CLEANUP_REGISTERED = True
+    print("  [OK] 已注册紧急恢复处理器（Ctrl+C安全）")
+
+
+def cleanup_after_period(period_idx: int) -> None:
+    """每个时间段处理完成后的清理工作，防止内存累积"""
+    # 1. 强制垃圾回收
+    collected_total = 0
+    for _ in range(3):
+        collected_total += gc.collect()
+
+    # 2. 同步磁盘缓冲区
+    try:
+        subprocess.run(['sync'], check=False, timeout=10, capture_output=True)
+    except Exception:
+        pass
+
+    # 3. 获取内存状态（单行摘要）
+    mem_info = ""
+    try:
+        result = subprocess.run(['free', '-h'], capture_output=True, text=True, timeout=5)
+        lines = result.stdout.strip().split('\n')
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            if len(parts) >= 4:
+                mem_info = f"内存: {parts[2]}已用/{parts[1]}总计"
+    except Exception:
+        pass
+
+    parts = [f"GC回收{collected_total}对象"]
+    if mem_info:
+        parts.append(mem_info)
+    print(f"  [OK] 清理完成 ({', '.join(parts)})")
+
+
 def save_pipeline_log(output_dir: str) -> None:
     """保存流程日志到JSON文件"""
     log_filename = "pipeline_log.json"
@@ -65,10 +203,10 @@ def save_pipeline_log(output_dir: str) -> None:
     try:
         with open(log_path, 'w', encoding='utf-8') as f:
             json.dump(PIPELINE_LOG, f, ensure_ascii=False, indent=2)
-        print(f"\n📝 流程日志已保存: {log_filename}")
+        print(f"  [OK] 流程日志已保存: {log_filename}")
         return log_path
     except Exception as e:
-        print(f"\n⚠️  保存流程日志失败: {e}")
+        log_warn(f"保存流程日志失败: {e}")
         return None
 
 
@@ -153,10 +291,7 @@ def run_shell_command(command: str, step_name: str, capture_output: bool = False
         包含执行信息的字典，如果 capture_output=True，还会包含 'output' 字段
     """
     start_time = time.time()
-    print(f"\n{'='*60}")
-    print(f"🚀 开始执行：{step_name}")
-    print(f"命令：{command}")
-    print(f"{'='*60}")
+    log_header(step_name, level=3)
 
     process = subprocess.Popen(
         command,
@@ -167,18 +302,24 @@ def run_shell_command(command: str, step_name: str, capture_output: bool = False
     )
 
     output_lines = []
-    if process.stdout:
-        for line in process.stdout:
-            try:
-                decoded_line = line.decode('utf-8', errors='ignore').strip()
-            except Exception:
-                decoded_line = line.decode(sys.getdefaultencoding(), errors='ignore').strip()
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                try:
+                    decoded_line = line.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    decoded_line = line.decode(sys.getdefaultencoding(), errors='ignore').strip()
 
-            print(decoded_line)
-            if capture_output:
-                output_lines.append(decoded_line)
+                print(decoded_line)
+                if capture_output:
+                    output_lines.append(decoded_line)
 
-    process.wait()
+        process.wait()
+    except Exception:
+        # 确保子进程被清理，避免僵尸进程
+        process.kill()
+        process.wait()
+        raise
     duration = time.time() - start_time
 
     result = {
@@ -193,13 +334,10 @@ def run_shell_command(command: str, step_name: str, capture_output: bool = False
         result["output"] = output_lines
 
     if process.returncode != 0:
-        print(f"\n❌ 步骤 [{step_name}] 执行失败！错误码：{process.returncode}")
+        log_fail(f"{step_name} (错误码: {process.returncode}, 耗时: {fmt_time(duration)})")
         raise RuntimeError(f"步骤 [{step_name}] 执行失败！错误码：{process.returncode}")
 
-    # 优化：强制同步磁盘，防止IO积压导致后续步骤变慢
-    subprocess.run("sync", shell=True)
-
-    print(f"\n✅ 步骤 [{step_name}] 执行完成！（耗时: {duration:.2f}秒）")
+    log_ok(f"{step_name} ({fmt_time(duration)})")
     return result
 
 
@@ -225,10 +363,10 @@ def get_bag_date(bag_path: str) -> str:
             bag_start_time_ns = reader.start_time
             bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
             bag_date = bag_datetime.strftime('%Y%m%d')
-            print(f"📅 从 bag 获取实际数据日期: {bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
+            log_kv("Bag数据日期", f"{bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
             return bag_date
     except Exception as e:
-        print(f"⚠️  无法从 bag 获取日期，使用当前日期: {e}")
+        log_warn(f"无法从bag获取日期，使用当前日期: {e}")
         return datetime.now().strftime('%Y%m%d')
 
 
@@ -250,9 +388,6 @@ def modify_filter_script(start_time: str, end_time: str) -> None:
     """
     # 检查是否使用统一配置
     if USE_UNIFIED_CONFIG:
-        print(f"✅ 使用统一配置文件，跳过脚本内时间更新")
-        print(f"   - 开始时间：{start_time}（HHMMSS）")
-        print(f"   - 结束时间：{end_time}（HHMMSS）")
         return
 
     # 旧方式：直接修改脚本文件（已废弃）
@@ -280,9 +415,7 @@ def modify_filter_script(start_time: str, end_time: str) -> None:
     with open(FILTER_SCRIPT_PATH, 'w', encoding='utf-8') as f:
         f.writelines(updated_lines)
 
-    print(f"✅ 已更新筛选脚本的时间段配置：")
-    print(f"   - 开始时间：{start_time}（HHMMSS）")
-    print(f"   - 结束时间：{end_time}（HHMMSS）")
+    print(f"  [OK] 已更新筛选脚本时间段: {start_time} -> {end_time}")
 
 
 def save_move_record(period_idx: int, start_time: str, end_time: str, moved_files: Dict[str, str]) -> str:
@@ -301,7 +434,7 @@ def save_move_record(period_idx: int, start_time: str, end_time: str, moved_file
             'timestamp': datetime.now().isoformat()
         }, f, indent=2, ensure_ascii=False)
     
-    print(f"📝 已保存移动记录到：{record_path}")
+    print(f"    移动记录已保存: {record_filename}")
     return record_path
 
 
@@ -310,7 +443,7 @@ def restore_moved_files(record_path: str) -> Tuple[int, int]:
     记录文件格式：{目标路径: 原始路径}，由 move_file.py 实时写入。
     """
     if not os.path.exists(record_path):
-        print(f"⚠️  记录文件不存在：{record_path}")
+        log_warn(f"记录文件不存在: {record_path}")
         return 0, 0
 
     try:
@@ -319,8 +452,7 @@ def restore_moved_files(record_path: str) -> Tuple[int, int]:
 
         total_files = len(moved_files)
         success_count = 0
-
-        print(f"🔄 正在恢复 {total_files} 个db3文件...")
+        failed_files = []
 
         for dest_path, src_path in moved_files.items():
             try:
@@ -330,30 +462,28 @@ def restore_moved_files(record_path: str) -> Tuple[int, int]:
                     shutil.move(dest_path, src_path)
                     if os.path.exists(src_path):
                         success_count += 1
-                        print(f"   ✅ 已恢复：{os.path.basename(dest_path)} -> {src_path}")
                     else:
-                        print(f"   ❌ 恢复失败：移动后源路径不存在 {src_path}")
+                        failed_files.append(os.path.basename(dest_path))
                 elif os.path.exists(src_path):
-                    # 文件已在原始位置（可能之前恢复过），视为成功
                     success_count += 1
-                    print(f"   ✅ 已在原位：{os.path.basename(dest_path)}")
                 else:
-                    print(f"   ❌ 文件两端均不存在，无法恢复：{os.path.basename(dest_path)}")
+                    failed_files.append(os.path.basename(dest_path))
             except Exception as e:
-                print(f"   ❌ 恢复失败：{os.path.basename(dest_path)} - {str(e)}")
+                failed_files.append(f"{os.path.basename(dest_path)}({e})")
 
-        print(f"\n✅ 文件恢复完成：成功 {success_count}/{total_files}")
-
-        # 仅在全部恢复成功时才删除记录文件，否则保留供人工排查
         if success_count == total_files:
+            log_ok(f"db3文件恢复完成: {success_count}/{total_files}")
             os.remove(record_path)
         else:
-            print(f"⚠️  恢复不完整，记录文件保留供排查：{record_path}")
+            log_warn(f"db3文件恢复不完整: {success_count}/{total_files}")
+            for f in failed_files:
+                print(f"      失败: {f}")
+            print(f"      记录文件保留供排查: {record_path}")
 
         return success_count, total_files
 
     except Exception as e:
-        print(f"❌ 读取记录文件失败：{str(e)}")
+        log_fail(f"读取记录文件失败: {e}")
         return 0, 0
 
 
@@ -362,9 +492,9 @@ def cleanup_move_records():
     if os.path.exists(MOVE_RECORD_DIR):
         try:
             shutil.rmtree(MOVE_RECORD_DIR)
-            print(f"🗑️  已清理移动记录目录：{MOVE_RECORD_DIR}")
+            log_ok(f"已清理移动记录目录: {MOVE_RECORD_DIR}")
         except Exception as e:
-            print(f"⚠️  清理移动记录目录失败：{str(e)}")
+            log_warn(f"清理移动记录目录失败: {e}")
 
 
 def find_undistorted_folder(preprocess_out_dir: str) -> Optional[str]:
@@ -386,7 +516,7 @@ def run_check_and_compress(
     """调用外部检查压缩脚本，执行压缩流程，返回实际生成的压缩包路径"""
     # 注意：不在这里生成文件名，让 check_and_compress.py 根据 bag 时间戳生成
     # 这样可以确保使用实际数据时间而非本地处理时间
-    compress_filename = f"PLACEHOLDER_{start_time}-{end_time}.{COMPRESS_FORMAT}"
+    compress_filename = f"PLACEHOLDER_{start_time}_{end_time}.{COMPRESS_FORMAT}"
     compress_path = os.path.join(compress_output_dir, compress_filename)
 
     check_compress_cmd = (
@@ -397,13 +527,12 @@ def run_check_and_compress(
         f"--period {start_time}_{end_time}"
     )
 
-    # 如果提供了 bag 路径，传递给压缩脚本以获取实际数据时间
     if bag_path:
         check_compress_cmd += f" --bag-path {bag_path}"
 
     result = run_shell_command(
         check_compress_cmd,
-        f"第{period_idx}个时间段 - 步骤4/4：检查+压缩",
+        f"检查+压缩",
         capture_output=True
     )
 
@@ -412,14 +541,11 @@ def run_check_and_compress(
     if "output" in result:
         for line in result["output"]:
             if "COMPRESS_SUCCESS:" in line:
-                # 提取路径：格式为 "✅ COMPRESS_SUCCESS: /path/to/file.zip"
                 actual_compress_path = line.split("COMPRESS_SUCCESS:")[-1].strip()
-                print(f"📦 实际压缩包路径: {actual_compress_path}")
                 break
 
-    # 如果没有解析到路径，回退到原始路径（但可能不存在）
     if not actual_compress_path:
-        print(f"⚠️  未能从输出解析压缩包路径，使用预期路径")
+        log_warn("未能从输出解析压缩包路径，使用预期路径")
         actual_compress_path = compress_path
 
     return actual_compress_path
@@ -430,9 +556,9 @@ def delete_raw_undistorted(undistorted_path: str) -> None:
     if DELETE_RAW_UNDISTORTED and os.path.exists(undistorted_path):
         try:
             shutil.rmtree(undistorted_path)
-            print(f"✅ 已删除原始 undistorted 目录：{undistorted_path}")
+            log_ok(f"已删除 undistorted 目录")
         except Exception as e:
-            print(f"⚠️  删除原始 undistorted 目录失败：{str(e)}")
+            log_warn(f"删除 undistorted 目录失败: {e}")
 
 
 def delete_preprocess_dir(preprocess_dir: str, compress_path: str) -> None:
@@ -446,37 +572,27 @@ def delete_preprocess_dir(preprocess_dir: str, compress_path: str) -> None:
         return
 
     if not os.path.exists(preprocess_dir):
-        print(f"⚠️  预处理目录不存在，无需删除：{preprocess_dir}")
         return
 
-    # 确保压缩包存在且在预处理目录内
     if not os.path.exists(compress_path):
-        print(f"⚠️  压缩包不存在，不删除预处理目录：{compress_path}")
+        log_warn(f"压缩包不存在，不删除预处理目录")
         return
 
-    # 将压缩包移动到预处理目录的父目录
     try:
         compress_filename = os.path.basename(compress_path)
         parent_dir = os.path.dirname(preprocess_dir)
         new_compress_path = os.path.join(parent_dir, compress_filename)
 
-        # 如果压缩包已经在父目录，直接删除预处理目录
-        if os.path.abspath(compress_path) == os.path.abspath(new_compress_path):
-            print(f"📦 压缩包已在目标位置：{compress_path}")
-        else:
-            # 移动压缩包到父目录
+        if os.path.abspath(compress_path) != os.path.abspath(new_compress_path):
             shutil.move(compress_path, new_compress_path)
-            print(f"📦 已移动压缩包到：{new_compress_path}")
 
-        # 删除整个预处理目录
         shutil.rmtree(preprocess_dir)
-        print(f"🗑️  已删除预处理目录：{preprocess_dir}")
-        print(f"✅ 最终产物：{new_compress_path}")
+        log_ok(f"已清理预处理目录，最终产物: {compress_filename}")
 
         return new_compress_path
 
     except Exception as e:
-        print(f"⚠️  清理预处理目录失败：{str(e)}")
+        log_warn(f"清理预处理目录失败: {e}")
         return compress_path
 
 
@@ -484,34 +600,28 @@ def delete_preprocess_dir(preprocess_dir: str, compress_path: str) -> None:
 def cleanup_by_simple_json(preprocess_out_dir: str, period_idx: int) -> dict:
     """根据simple.json清理文件，返回清理信息"""
     start_time = time.time()
-    print(f"\n{'='*60}")
-    print(f"🧹 开始根据 simple.json 清理文件（时间段：{period_idx}）")
-    print(f"{'='*60}")
-    
+
     undistorted_path = find_undistorted_folder(preprocess_out_dir)
     if not undistorted_path:
-        print(f"⚠️  未找到 undistorted 文件夹，跳过清理步骤")
+        log_skip("未找到 undistorted 文件夹，跳过JSON清理")
         return {"status": "skipped", "reason": "undistorted folder not found", "duration_seconds": round(time.time() - start_time, 2)}
-    
+
     json_path = os.path.join(undistorted_path, SIMPLE_JSON_NAME)
     if not os.path.exists(json_path):
-        print(f"⚠️  未找到 {SIMPLE_JSON_NAME}，跳过清理步骤")
+        log_skip(f"未找到 {SIMPLE_JSON_NAME}，跳过JSON清理")
         return {"status": "skipped", "reason": "simple.json not found", "duration_seconds": round(time.time() - start_time, 2)}
-    
-    print(f"📁 undistorted 目录：{undistorted_path}")
-    print(f"📄 找到 simple.json：{json_path}")
-    
+
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             json_data = json.load(f)
-        
+
         if not isinstance(json_data, list):
-            print(f"⚠️  simple.json 格式错误：根元素必须是列表")
+            log_warn(f"{SIMPLE_JSON_NAME} 格式错误: 根元素必须是列表")
             return {"status": "failed", "reason": "invalid json format", "duration_seconds": round(time.time() - start_time, 2)}
-        
+
         required_files = {}
         deleted_count = 0
-        
+
         for item in json_data:
             for key, value in item.items():
                 if (key.startswith("camera_") or key.startswith("iv_points_")) and value != "NOT_FOUND":
@@ -519,54 +629,76 @@ def cleanup_by_simple_json(preprocess_out_dir: str, period_idx: int) -> dict:
                     if folder_name not in required_files:
                         required_files[folder_name] = set()
                     required_files[folder_name].add(value)
-        
+
         if not required_files:
-            print(f"⚠️  simple.json 中没有找到有效的字段，跳过清理")
+            log_skip(f"{SIMPLE_JSON_NAME} 中没有有效字段")
             return {"status": "skipped", "reason": "no valid fields in json", "duration_seconds": round(time.time() - start_time, 2)}
-        
-        print(f"🔍 识别出 {len(required_files)} 个需要清理的文件夹")
-        
+
         for folder_name, files_to_keep in required_files.items():
             folder_path = os.path.join(undistorted_path, folder_name)
             if not os.path.exists(folder_path):
                 continue
-            
+
             for root, dirs, filenames in os.walk(folder_path):
                 for filename in filenames:
                     if filename.endswith('.npy'):
                         continue
-                    
+
                     file_path = os.path.join(root, filename)
                     basename = os.path.basename(filename)
-                    
+
                     should_delete = True
                     for required_file in files_to_keep:
                         if basename == required_file or basename in required_file or required_file in basename:
                             should_delete = False
                             break
-                    
+
                     if should_delete:
                         try:
                             os.remove(file_path)
                             deleted_count += 1
                         except Exception:
                             pass
-        
-        print(f"\n✅ 清理完成！总共删除了 {deleted_count} 个文件")
+
+        duration = round(time.time() - start_time, 2)
+        log_ok(f"JSON清理完成: 删除 {deleted_count} 个文件, 涉及 {len(required_files)} 个文件夹 ({fmt_time(duration)})")
         return {
             "status": "success",
             "folders_cleaned": len(required_files),
             "files_deleted": deleted_count,
-            "duration_seconds": round(time.time() - start_time, 2)
+            "duration_seconds": duration
         }
-        
+
     except Exception as e:
-        print(f"❌ 清理过程发生错误：{str(e)}")
+        log_fail(f"JSON清理异常: {e}")
         return {
             "status": "failed",
             "error": str(e),
             "duration_seconds": round(time.time() - start_time, 2)
         }
+
+
+def check_disk_space(path: str, min_free_gb: float = 50.0) -> bool:
+    """检查指定路径的磁盘剩余空间是否充足
+
+    Args:
+        path: 要检查的路径
+        min_free_gb: 最小剩余空间（GB）
+
+    Returns:
+        True 表示空间充足，False 表示不足
+    """
+    try:
+        statvfs = os.statvfs(path)
+        free_bytes = statvfs.f_frsize * statvfs.f_bavail
+        free_gb = free_bytes / (1024 ** 3)
+        if free_gb < min_free_gb:
+            log_fail(f"磁盘空间不足: {free_gb:.1f}GB < {min_free_gb}GB")
+            return False
+        return True
+    except Exception as e:
+        log_warn(f"无法检查磁盘空间: {e}")
+        return True  # 检查失败时不阻塞流程
 
 
 def process_single_period(
@@ -577,14 +709,14 @@ def process_single_period(
     output_root: str,
     logtime: str,
     vehicle: str,
-    main_out: str
+    main_out: str,
+    total_periods: int
 ) -> dict:
     """处理单个时间段的全流程（筛选+预处理+清理+检查压缩）"""
     period_start_time = time.time()
-    print(f"\n{'='*80}")
-    print(f"📌 开始处理第 {period_idx}/{total_periods} 个时间段：{start_time} → {end_time}")
-    print(f"📦 文件模式：{'移动' if MOVE_MODE else '复制'}")
-    print(f"{'='*80}")
+    period_label = f"时间段 {period_idx}/{total_periods}: {start_time} -> {end_time}"
+    log_header(period_label, level=2)
+    print(f"    模式: {'移动' if MOVE_MODE else '复制'} | 车辆: {vehicle} | 日志时间: {logtime}")
     
     # 初始化日志记录
     period_log = {
@@ -598,27 +730,24 @@ def process_single_period(
     
     # 初始化
     filtered_folder = get_filtered_folder_path(output_root, start_time, end_time)
-    # 先使用临时目录名，等获取到实际日期后再重命名
-    preprocess_out_dir_temp = os.path.join(main_out, f"{start_time}_{end_time}")
     move_record_path = os.path.join("move_records", f"move_record_{start_time}_{end_time}.json")
 
     try:
-        # 1. 打印配置信息
-        print(f"\n📥 源db3目录：{source_dir}")
-        print(f"📤 筛选输出目录：{filtered_folder}")
-        print(f"⚙️  预处理输出目录（临时）：{preprocess_out_dir_temp}")
-        print(f"🚗 车辆型号：{vehicle}")
-        print(f"⏰ 日志时间戳：{logtime}")
+        # 1. 检查磁盘空间
+        if not check_disk_space(main_out, min_free_gb=50.0):
+            period_log["status"] = "failed"
+            period_log["reason"] = "insufficient disk space"
+            period_log["duration_seconds"] = round(time.time() - period_start_time, 2)
+            period_log["end_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return period_log
 
         # 2. 更新筛选脚本的时间段
         modify_filter_script(start_time, end_time)
 
         # 3. 执行筛选db3文件（使用移动模式）
-        print(f"\n🔧 开始筛选步骤...")
-
-        # 创建移动记录文件路径
         if MOVE_MODE:
             move_record_path = os.path.join(tempfile.gettempdir(), f"move_{period_idx}_{start_time}_{end_time}.json")
+            ACTIVE_MOVE_RECORDS.append(move_record_path)
 
         # 构建筛选命令
         filter_cmd = (
@@ -632,45 +761,48 @@ def process_single_period(
         if MOVE_MODE:
             filter_cmd += f" --move --save-record {move_record_path}"
 
-        filter_result = run_shell_command(filter_cmd, f"第{period_idx}个时间段 - 步骤1/4：筛选db3文件")
+        filter_result = run_shell_command(filter_cmd, f"筛选db3文件")
         period_log["steps"].append(filter_result)
 
         # 4. 检查筛选结果
         if not os.path.exists(filtered_folder):
-            print(f"❌ 筛选失败：未生成目标文件夹 {filtered_folder}")
-            print(f"   跳过当前时间段，继续处理下一个...")
+            log_fail(f"筛选失败: 未生成目标文件夹 {filtered_folder}")
+            print(f"    跳过当前时间段，继续下一个...")
             period_log["status"] = "failed"
             period_log["reason"] = "filter output folder not created"
             period_log["duration_seconds"] = round(time.time() - period_start_time, 2)
             period_log["end_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             return period_log
 
-        # 4.5. 从筛选后的 bag 获取实际日期，并确定最终输出目录名
+        # 4.5. 从筛选后的 bag 获取实际日期
         bag_date = get_bag_date(filtered_folder)
         preprocess_out_dir = os.path.join(main_out, f"{bag_date}_{start_time}_{end_time}")
-        print(f"📁 最终输出目录: {preprocess_out_dir}")
 
-        # 5. 执行预处理（这一步需要db3文件存在）
-        print(f"\n⚙️  开始预处理步骤...")
+        # 5. 执行预处理
         run_export_cmd = (
             f"{sys.executable} {RUN_EXPORT_SCRIPT_PATH} "
             f"--bag {filtered_folder} "
             f"--out {preprocess_out_dir} "
             f"--vehicle {vehicle} "
-            f"--logtime {logtime}"
+            f"--logtime {logtime} "
+            f"--start-time {start_time} "
+            f"--end-time {end_time} "
+            f"--skip-compress"
         )
-        export_result = run_shell_command(run_export_cmd, f"第{period_idx}个时间段 - 步骤2/4：预处理")
+        export_result = run_shell_command(run_export_cmd, f"预处理(camera+lidar+imu+undistort+sample)")
         period_log["steps"].append(export_result)
-        
-        print(f"✅ 预处理完成，现在可以安全恢复db3文件...")
-        
-        print(f"\n第{period_idx}个时间段 - 步骤3/4：恢复与清理")
+
+        # 6. 恢复与清理
+        log_header("恢复与清理", level=3)
         
         # 6. 恢复db3文件（在预处理完成后）
         restore_start = time.time()
         if MOVE_MODE and move_record_path and os.path.exists(move_record_path):
-            print(f"\n🔄 恢复db3文件到原始位置...")
             success_count, total_count = restore_moved_files(move_record_path)
+
+            if move_record_path in ACTIVE_MOVE_RECORDS:
+                ACTIVE_MOVE_RECORDS.remove(move_record_path)
+
             period_log["steps"].append({
                 "step_name": "恢复db3文件",
                 "status": "success" if success_count == total_count else "partial",
@@ -679,9 +811,9 @@ def process_single_period(
                 "duration_seconds": round(time.time() - restore_start, 2)
             })
             if success_count < total_count:
-                print(f"⚠️  部分文件恢复失败，请检查源目录和目标目录")
+                log_warn("部分文件恢复失败，请检查源目录和目标目录")
         elif MOVE_MODE:
-            print(f"⚠️  移动记录文件不存在，无法恢复db3文件")
+            log_warn("移动记录文件不存在，无法恢复db3文件")
             period_log["steps"].append({
                 "step_name": "恢复db3文件",
                 "status": "skipped",
@@ -700,9 +832,8 @@ def process_single_period(
                 # 如果文件夹为空，删除整个文件夹
                 if len(os.listdir(filtered_folder)) == 0:
                     os.rmdir(filtered_folder)
-                    print(f"🗑️  已清理临时文件夹：{filtered_folder}")
-            except Exception as e:
-                print(f"⚠️  清理临时文件夹失败：{str(e)}")
+            except Exception:
+                pass
         
         # 8. 其他后续步骤
         if CLEAN_BY_SIMPLE_JSON:
@@ -724,7 +855,7 @@ def process_single_period(
                     period_idx=period_idx,
                     start_time=start_time,
                     end_time=end_time,
-                    bag_path=filtered_folder  # 传递 bag 路径以获取实际数据时间
+                    bag_path=source_dir  # 传递原始 bag 路径以获取实际数据时间
                 )
                 period_log["steps"].append({
                     "step_name": "检查+压缩",
@@ -732,25 +863,25 @@ def process_single_period(
                     "compress_path": compress_path if compress_path else None,
                     "duration_seconds": round(time.time() - compress_start, 2)
                 })
-                delete_raw_undistorted(undistorted_path)
 
                 # 10. 清理预处理目录，仅保留压缩包
                 if compress_path and os.path.exists(compress_path):
-                    final_compress_path = delete_preprocess_dir(preprocess_out_dir, compress_path)
-                    if final_compress_path:
-                        compress_path = final_compress_path
-                        period_log["compress_path"] = final_compress_path
+                    if DELETE_PREPROCESS_DIR:
+                        # 整个目录都会被删除，无需单独删 undistorted
+                        final_compress_path = delete_preprocess_dir(preprocess_out_dir, compress_path)
+                        if final_compress_path:
+                            compress_path = final_compress_path
+                            period_log["compress_path"] = final_compress_path
+                    else:
+                        # 只删除 undistorted 原始目录，保留预处理目录
+                        delete_raw_undistorted(undistorted_path)
 
         # 11. 打印完成信息
-        print(f"\n✅ 第 {period_idx} 个时间段处理完成！")
-        if DELETE_PREPROCESS_DIR:
-            print(f"   最终产物：{compress_path}")
+        period_duration = time.time() - period_start_time
+        if DELETE_PREPROCESS_DIR and compress_path:
+            log_ok(f"时间段 {period_idx}/{total_periods} 完成 ({fmt_time(period_duration)}) -> {os.path.basename(str(compress_path))}")
         else:
-            print(f"   预处理结果：{preprocess_out_dir}")
-            if compress_path and os.path.exists(compress_path):
-                print(f"   压缩包：{compress_path}")
-        if MOVE_MODE:
-            print(f"   db3文件：已移动并恢复")
+            log_ok(f"时间段 {period_idx}/{total_periods} 完成 ({fmt_time(period_duration)}) -> {preprocess_out_dir}")
         
         # 记录成功完成
         period_log["status"] = "success"
@@ -759,24 +890,30 @@ def process_single_period(
             period_log["compress_path"] = compress_path
         period_log["duration_seconds"] = round(time.time() - period_start_time, 2)
         period_log["end_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 性能优化：每个时间段后清理内存
+        cleanup_after_period(period_idx)
+
         return period_log
         
     except Exception as e:
-        print(f"\n❌ 第 {period_idx} 个时间段处理异常：{str(e)}")
-        
+        log_fail(f"时间段 {period_idx} 异常: {e}")
+
         # 发生异常时也要尝试恢复文件
         if MOVE_MODE and move_record_path and os.path.exists(move_record_path):
-            print(f"🔄 发生异常，尝试恢复db3文件...")
+            log_warn("发生异常，尝试恢复db3文件...")
             restore_moved_files(move_record_path)
-        
+
+            if move_record_path in ACTIVE_MOVE_RECORDS:
+                ACTIVE_MOVE_RECORDS.remove(move_record_path)
+
         # 清理临时文件
         if os.path.exists(filtered_folder):
             try:
                 shutil.rmtree(filtered_folder)
-                print(f"🗑️  已清理临时文件夹：{filtered_folder}")
-            except:
+            except Exception:
                 pass
-        
+
         # 记录异常
         period_log["status"] = "failed"
         period_log["error"] = str(e)
@@ -786,9 +923,12 @@ def process_single_period(
 
 
 def main():
-    global total_periods, SESSION_START_TIME
+    global SESSION_START_TIME
     SESSION_START_TIME = time.time()
-    
+
+    # 注册紧急恢复处理器（必须在最开始）
+    register_cleanup_handlers()
+
     import argparse
     parser = argparse.ArgumentParser(description="ROS 2 Bag 批量时间筛选 + 预处理 + 检查压缩全流程脚本")
     parser.add_argument("--logtime", type=str, required=True, help="日志时间戳（如：20251124_111515，用于 run_export.py）")
@@ -818,18 +958,16 @@ def main():
     try:
         time_periods = load_time_periods(args.yaml_path)
         total_periods = len(time_periods)
-        print(f"✅ 成功加载 {total_periods} 个时间段：")
-        for i, (start, end) in enumerate(time_periods, 1):
-            print(f"   {i}. {start} → {end}")
+        print(f"  [OK] 加载 {total_periods} 个时间段 (从 {time_periods[0][0]} 到 {time_periods[-1][1]})")
     except Exception as e:
-        print(f"❌ 加载时间段配置失败：{str(e)}")
+        log_fail(f"加载时间段配置失败: {e}")
         sys.exit(1)
     
     # 2. 读取 filter_by_time.py 的真实配置
     try:
         SOURCE_DIRECTORY, OUTPUT_ROOT_DIRECTORY = get_filter_script_config()
     except Exception as e:
-        print(f"❌ 读取筛选脚本配置失败：{str(e)}")
+        log_fail(f"读取筛选脚本配置失败: {e}")
         sys.exit(1)
     
     # 3. 检查基础路径
@@ -842,22 +980,20 @@ def main():
     
     for script_path, script_name in required_scripts:
         if not os.path.exists(script_path):
-            print(f"❌ 未找到{script_name}：{script_path}")
+            log_fail(f"未找到{script_name}: {script_path}")
             sys.exit(1)
     
     # 4. 检查目录
     if not os.path.exists(SOURCE_DIRECTORY):
-        print(f"❌ 源db3目录不存在：{SOURCE_DIRECTORY}")
+        log_fail(f"源db3目录不存在: {SOURCE_DIRECTORY}")
         sys.exit(1)
-    
+
     if not os.path.exists(OUTPUT_ROOT_DIRECTORY):
-        print(f"⚠️  筛选输出根目录不存在：{OUTPUT_ROOT_DIRECTORY}")
-        print(f"   正在自动创建该目录...")
         try:
             os.makedirs(OUTPUT_ROOT_DIRECTORY, exist_ok=True)
-            print(f"✅ 成功创建筛选输出根目录：{OUTPUT_ROOT_DIRECTORY}")
+            log_ok(f"已创建筛选输出根目录: {OUTPUT_ROOT_DIRECTORY}")
         except Exception as e:
-            print(f"❌ 创建筛选输出根目录失败：{str(e)}")
+            log_fail(f"创建筛选输出根目录失败: {e}")
             sys.exit(1)
     
     # 5. 创建主输出目录
@@ -883,21 +1019,16 @@ def main():
     }
     
     # 打印全局配置信息
-    print("\n========================================")
-    print("📋 全局配置信息")
-    print("========================================")
-    print(f"📥 源db3目录：{SOURCE_DIRECTORY}")
-    print(f"📤 筛选输出根目录：{OUTPUT_ROOT_DIRECTORY}")
-    print(f"⚙️  预处理主输出：{args.main_out}")
-    print(f"🚗 车辆型号：{args.vehicle}")
-    print(f"⏰ 日志时间戳：{args.logtime}")
-    print(f"📄 YAML配置文件：{args.yaml_path}")
-    print(f"📦 文件模式：{'移动' if MOVE_MODE else '复制'}")
-    if MOVE_MODE:
-        print(f"📝 移动记录目录：{MOVE_RECORD_DIR}")
-    print(f"🧹 simple.json清理：{'启用' if CLEAN_BY_SIMPLE_JSON else '禁用'}")
-    print(f"🗜️  检查压缩流程：{'启用' if not SKIP_CHECK_COMPRESS else '禁用'}")
-    print("========================================\n")
+    log_header("ROS2 Bag 批量处理流水线", level=1)
+    log_kv("源db3目录", SOURCE_DIRECTORY)
+    log_kv("筛选输出", OUTPUT_ROOT_DIRECTORY)
+    log_kv("预处理输出", args.main_out)
+    log_kv("车辆型号", args.vehicle)
+    log_kv("日志时间戳", args.logtime)
+    log_kv("时间段", f"{total_periods} 个 ({time_periods[0][0]} ~ {time_periods[-1][1]})")
+    log_kv("文件模式", '移动' if MOVE_MODE else '复制')
+    log_kv("JSON清理", '启用' if CLEAN_BY_SIMPLE_JSON else '禁用')
+    log_kv("检查压缩", '启用' if not SKIP_CHECK_COMPRESS else '禁用')
     
     # 7. 批量处理每个时间段
     success_count = 0
@@ -913,7 +1044,8 @@ def main():
                 output_root=OUTPUT_ROOT_DIRECTORY,
                 logtime=args.logtime,
                 vehicle=args.vehicle,
-                main_out=args.main_out
+                main_out=args.main_out,
+                total_periods=total_periods
             )
             PIPELINE_LOG["periods_processed"].append(period_log)
             if period_log["status"] == "success":
@@ -921,8 +1053,8 @@ def main():
             else:
                 fail_count += 1
         except Exception as e:
-            print(f"\n❌ 第 {period_idx} 个时间段处理异常：{str(e)}")
-            print(f"   跳过当前时间段，继续处理下一个...\n")
+            log_fail(f"时间段 {period_idx} 异常: {e}")
+            print(f"    跳过当前时间段，继续下一个...")
             fail_count += 1
             # 记录异常的时间段
             PIPELINE_LOG["periods_processed"].append({
@@ -948,18 +1080,16 @@ def main():
     }
     
     # 输出总体统计结果
-    print(f"\n{'='*80}")
-    print("📊 批量处理完成！总体统计：")
-    print(f"   总时间段数：{total_periods}")
-    print(f"   成功处理：{success_count} 个")
-    print(f"   失败/跳过：{fail_count} 个")
-    print(f"   成功率：{PIPELINE_LOG['summary']['success_rate']}")
-    print(f"   总耗时：{PIPELINE_LOG['summary']['total_duration_formatted']}")
-    print(f"   平均耗时：{PIPELINE_LOG['summary']['average_time_per_period_seconds']:.2f}秒/时间段")
-    print(f"📁 所有预处理结果均保存在：{args.main_out}")
+    log_header("批量处理完成", level=1)
+    log_kv("总时间段", str(total_periods))
+    log_kv("成功", str(success_count))
+    log_kv("失败/跳过", str(fail_count))
+    log_kv("成功率", PIPELINE_LOG['summary']['success_rate'])
+    log_kv("总耗时", PIPELINE_LOG['summary']['total_duration_formatted'])
+    log_kv("平均耗时", f"{PIPELINE_LOG['summary']['average_time_per_period_seconds']:.1f}s/时间段")
+    log_kv("输出目录", args.main_out)
     if MOVE_MODE:
-        print(f"📦 使用移动模式：db3文件已全部恢复原始位置")
-    print(f"{'='*80}")
+        log_kv("db3文件", "已全部恢复原始位置")
     
     # 保存日志
     save_pipeline_log(args.main_out)

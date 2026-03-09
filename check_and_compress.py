@@ -53,31 +53,23 @@ class FolderCompressor:
                 # 计算剩余空间：块大小 * 可用块数
                 return statvfs.f_frsize * statvfs.f_bavail
         except Exception as e:
-            print(f"  ❌ 获取磁盘空间失败: {e}")
+            print(f"  [FAIL] 获取磁盘空间失败: {e}")
             return -1
     
     def check_disk_space(self):
         """检查目标目录的剩余空间是否满足要求"""
-        print(f"\n📊 正在检查磁盘空间...")
         free_space = self.get_free_disk_space(self.root_dir)
-        
+
         if free_space < 0:
-            print(f"  ❌ 无法获取磁盘空间信息，程序终止")
+            print(f"  [FAIL] 无法获取磁盘空间信息")
             return False
-        
-        # 格式化空间大小显示
+
         free_space_gb = free_space / (1024 * 1024 * 1024)
-        
-        print(f"  📈 磁盘剩余空间: {free_space_gb:.2f} GB")
-        print(f"  📋 所需最小空间: {self.required_free_space_gb} GB")
-        
+
         if free_space >= self.required_free_space_bytes:
-            print(f"  ✅ 磁盘空间满足要求")
             return True
         else:
-            print(f"  ❌ 磁盘空间不足！")
-            print(f"     剩余: {free_space_gb:.2f} GB, 所需: {self.required_free_space_gb} GB")
-            print(f"     程序将立即终止，避免压缩失败")
+            print(f"  [FAIL] 磁盘空间不足: {free_space_gb:.1f}GB < {self.required_free_space_gb}GB")
             return False
     
     def get_undistorted_folder(self, target_folder_path):
@@ -86,12 +78,12 @@ class FolderCompressor:
             if target_folder_path.exists() and target_folder_path.is_dir():
                 return target_folder_path
             else:
-                print(f"  ❌ 文件夹不存在: {target_folder_path}")
+                print(f"  [FAIL] 文件夹不存在: {target_folder_path}")
                 return None
 
         undistorted_folder = target_folder_path / self.keep_folder_name
         if not undistorted_folder.exists() or not undistorted_folder.is_dir():
-            print(f"  ❌ 未找到 '{self.keep_folder_name}' 文件夹: {undistorted_folder}")
+            print(f"  [FAIL] 未找到 '{self.keep_folder_name}' 文件夹: {undistorted_folder}")
             return None
         return undistorted_folder
     
@@ -114,22 +106,22 @@ class FolderCompressor:
         if not undistorted_folder:
             return False
         
-        print(f"  🔍 正在检查 '{self.keep_folder_name}' 文件夹内的JSON文件...")
+        print(f"  检查JSON文件...")
         found_jsons = self.find_json_files(undistorted_folder)
         
         for json_file in self.required_json_files:
             if json_file not in found_jsons:
-                print(f"  ❌ 缺少JSON文件: {json_file}（在 {self.keep_folder_name} 目录下）")
+                print(f"  [FAIL] 缺少JSON文件: {json_file}")
                 return False
             
             json_path = found_jsons[json_file]
             # 检查JSON文件是否为空
             if json_path.stat().st_size == 0:
-                print(f"  ❌ JSON文件为空: {json_file}（路径: {json_path}）")
+                print(f"  [FAIL] JSON文件为空: {json_file}")
                 return False
             
         
-        print(f"  ✅ JSON文件检查通过（基于 {self.keep_folder_name} 目录）")
+        print(f"  [OK] JSON文件检查通过")
         return True
     
     def check_folder_structure(self, target_folder_path):
@@ -139,7 +131,7 @@ class FolderCompressor:
         if not undistorted_folder:
             return False
         
-        print(f"  🔍 正在检查 '{self.keep_folder_name}' 文件夹内的结构...")
+        print(f"  检查文件夹结构...")
         
         # 首先收集实际存在的文件夹
         existing_folders = {}
@@ -151,13 +143,13 @@ class FolderCompressor:
                 if folder_path.exists() and folder_path.is_dir():
                     existing_in_group.append(folder_path_str)
                 else:
-                    print(f"  ⚠️  文件夹不存在（跳过）: {self.keep_folder_name}/{folder_path_str}")
+                    print(f"  [WARN] 文件夹不存在(跳过): {folder_path_str}")
             
             if existing_in_group:
                 existing_folders[tuple(folder_group)] = existing_in_group
         
         if not existing_folders:
-            print(f"  ❌ 没有找到任何配置的文件夹")
+            print(f"  [FAIL] 没有找到任何配置的文件夹")
             return False
         
         # 检查文件夹文件数量（仅检查实际存在的文件夹）
@@ -183,20 +175,19 @@ class FolderCompressor:
                         max_deviation = max(abs(max_count - avg_count), abs(min_count - avg_count)) / avg_count
                         
                         if max_deviation > tolerance_percent:
-                            print(f"  ⚠️  文件夹组 {existing_in_group} 文件数量差异较大 (偏差: {max_deviation*100:.1f}%): {dict(zip(existing_in_group, file_counts))}")
-                            print(f"     但这在实际数据中是正常的，继续处理...")
+                            print(f"  [WARN] 文件夹组文件数量偏差 {max_deviation*100:.1f}%: {dict(zip(existing_in_group, file_counts))}")
                         else:
-                            print(f"  ✅ 文件夹组文件数量在合理范围内: {dict(zip(existing_in_group, file_counts))}")
+                            print(f"  [OK] 文件夹组数量一致: {dict(zip(existing_in_group, file_counts))}")
             
             elif len(existing_in_group) == 1:  # 单个文件夹检查是否为空
                 folder_path_str = existing_in_group[0]
                 folder_path = undistorted_folder / folder_path_str
                 file_count = len([f for f in folder_path.iterdir() if f.is_file()])
                 if file_count == 0:
-                    print(f"  ❌ 文件夹为空: {self.keep_folder_name}/{folder_path_str}")
+                    print(f"  [FAIL] 文件夹为空: {folder_path_str}")
                     return False
         
-        print(f"  ✅ 文件夹结构检查通过（基于 {self.keep_folder_name} 目录，检查了 {sum(len(v) for v in existing_folders.values())} 个文件夹）")
+        print(f"  [OK] 文件夹结构检查通过 ({sum(len(v) for v in existing_folders.values())} 个文件夹)")
         return True
     
     def extract_time_from_filename(self, filename):
@@ -211,7 +202,7 @@ class FolderCompressor:
                 datetime.strptime(hms_str, '%H%M%S')
                 return f"{hms_str[:2]}:{hms_str[2:4]}:{hms_str[4:6]}"
             except ValueError:
-                print(f"  ⚠️  警告：文件名 {filename} 中的时分秒 {hms_str} 格式无效")
+                print(f"  [WARN] 文件名时间格式无效: {filename} ({hms_str})")
                 return None
         
         # 备用匹配：仅匹配 6 位数字（HHMMSS）
@@ -223,7 +214,7 @@ class FolderCompressor:
                 datetime.strptime(hms_str, '%H%M%S')
                 return f"{hms_str[:2]}:{hms_str[2:4]}:{hms_str[4:6]}"
             except ValueError:
-                print(f"  ⚠️  警告：文件名 {filename} 中的时分秒 {hms_str} 格式无效")
+                print(f"  [WARN] 文件名时间格式无效: {filename} ({hms_str})")
                 return None
         
         return None
@@ -243,7 +234,7 @@ class FolderCompressor:
             end_time = datetime.strptime(end_str, '%H%M%S').strftime('%H:%M:%S')
             return start_time, end_time
         except ValueError as e:
-            print(f"  ⚠️  无法解析文件夹 {folder_name} 的时间范围: {e}")
+            print(f"  [WARN] 无法解析文件夹时间范围: {folder_name}: {e}")
             return None, None
     
     def check_time_consistency(self, target_folder_path, folder_name):
@@ -255,11 +246,10 @@ class FolderCompressor:
         
         folder_start, folder_end = self.parse_folder_time_range(folder_name)
         if not folder_start or not folder_end:
-            print(f"  ❌ 无法解析文件夹时间范围（需符合 HHMMSS_HHMMSS 格式）: {folder_name}")
+            print(f"  [FAIL] 无法解析文件夹时间范围: {folder_name}")
             return False
-        
-        print(f"  🕒 文件夹时间范围: {folder_start} - {folder_end}")
-        print(f"  🔍 正在检查 '{self.keep_folder_name}' 文件夹内的时间一致性...")
+
+        print(f"  检查时间一致性 ({folder_start} - {folder_end})...")
         all_time_folders_valid = True
         time_tolerance = timedelta(seconds=3)
         fmt = "%H:%M:%S"
@@ -268,28 +258,28 @@ class FolderCompressor:
             # 时间敏感文件夹路径相对于undistorted文件夹
             time_folder_path = undistorted_folder / time_folder_path_str
             if not time_folder_path.exists():
-                print(f"  ⚠️  时间敏感文件夹不存在: {self.keep_folder_name}/{time_folder_path_str}")
+                print(f"  [WARN] 时间敏感文件夹不存在: {time_folder_path_str}")
                 continue
             
             # 获取文件夹内所有非json、非npy文件并按文件名排序
             files = sorted([f for f in time_folder_path.iterdir() if f.is_file() 
                           and not (f.name.lower().endswith('.json') or f.name.lower().endswith('.npy'))])
             if not files:
-                print(f"  ❌ 时间敏感文件夹为空: {self.keep_folder_name}/{time_folder_path_str}")
+                print(f"  [FAIL] 时间敏感文件夹为空: {time_folder_path_str}")
                 all_time_folders_valid = False
                 continue
             
             # 检查第一个文件的时间
             first_file_time = self.extract_time_from_filename(files[0].name)
             if not first_file_time:
-                print(f"  ❌ 无法从文件提取时间: {files[0].name}")
+                print(f"  [FAIL] 无法从文件提取时间: {files[0].name}")
                 all_time_folders_valid = False
                 continue
             
             # 检查最后一个文件的时间
             last_file_time = self.extract_time_from_filename(files[-1].name)
             if not last_file_time:
-                print(f"  ❌ 无法从文件提取时间: {files[-1].name}")
+                print(f"  [FAIL] 无法从文件提取时间: {files[-1].name}")
                 all_time_folders_valid = False
                 continue
             
@@ -301,17 +291,17 @@ class FolderCompressor:
             
             # 检查时间差
             if abs(file_start_dt - folder_start_dt) > time_tolerance:
-                print(f"  ❌ 起始时间不匹配: {self.keep_folder_name}/{time_folder_path_str}")
-                print(f"     文件夹起始: {folder_start}, 文件起始: {first_file_time}")
+                print(f"  [FAIL] 起始时间不匹配: {time_folder_path_str}")
+                print(f"     文件夹: {folder_start}, 文件: {first_file_time}")
                 all_time_folders_valid = False
             
             if abs(file_end_dt - folder_end_dt) > time_tolerance:
-                print(f"  ❌ 结束时间不匹配: {self.keep_folder_name}/{time_folder_path_str}")
-                print(f"     文件夹结束: {folder_end}, 文件结束: {last_file_time}")
+                print(f"  [FAIL] 结束时间不匹配: {time_folder_path_str}")
+                print(f"     文件夹: {folder_end}, 文件: {last_file_time}")
                 all_time_folders_valid = False
         
         if all_time_folders_valid:
-            print(f"  ✅ 时间一致性检查通过（基于 {self.keep_folder_name} 目录）")
+            print(f"  [OK] 时间一致性检查通过")
         return all_time_folders_valid
     
     def format_file_size(self, size_bytes):
@@ -324,13 +314,12 @@ class FolderCompressor:
     
     def clean_folder_before_compress(self, target_folder_path):
         """清理文件夹：直接删除除指定保留文件夹外的所有内容（无确认）"""
-        print(f"  开始清理文件夹: {target_folder_path.name}")
-        print(f"  仅保留 '{self.keep_folder_name}' 文件夹，自动删除其他所有内容")
-        
-        # 先检查是否存在要保留的文件夹
+        print(f"  清理文件夹: {target_folder_path.name}")
+        print(f"  仅保留 '{self.keep_folder_name}' 文件夹")
+
         keep_folder = target_folder_path / self.keep_folder_name
         if not keep_folder.exists() or not keep_folder.is_dir():
-            print(f"  ⚠️  警告：未找到 '{self.keep_folder_name}' 文件夹，将删除所有内容！")
+            print(f"  [WARN] 未找到 '{self.keep_folder_name}' 文件夹")
         
         # 列出所有要删除的内容（不包括保留文件夹）
         items_to_delete = []
@@ -339,13 +328,9 @@ class FolderCompressor:
                 items_to_delete.append(item)
         
         if not items_to_delete:
-            print(f"  ✅ 无需清理：文件夹内仅包含 '{self.keep_folder_name}' 文件夹")
+            print(f"  [OK] 无需清理")
             return True
-        
-        # 显示要删除的项目数量
-        print(f"  📋 正在删除 {len(items_to_delete)} 个项目...")
-        
-        # 执行删除操作
+
         deleted_count = 0
         failed_items = []
         for item in items_to_delete:
@@ -359,20 +344,18 @@ class FolderCompressor:
                 failed_items.append(f"{item.name}: {str(e)}")
         
         # 输出删除结果
-        print(f"  ✅ 清理完成：成功删除 {deleted_count} 个项目")
+        print(f"  [OK] 清理完成: 删除 {deleted_count} 项")
         if failed_items:
-            print(f"  ⚠️  有 {len(failed_items)} 个项目删除失败：")
-            for item in failed_items:
-                print(f"     - {item}")
+            print(f"  [WARN] {len(failed_items)} 项删除失败")
         
         # 最后检查保留文件夹状态
         if keep_folder.exists() and keep_folder.is_dir():
             keep_folder_size = sum(f.stat().st_size for f in keep_folder.rglob('*') if f.is_file())
             if keep_folder_size == 0:
-                print(f"  ⚠️  警告：保留的 '{self.keep_folder_name}' 文件夹为空")
+                print(f"  [WARN] 保留的 '{self.keep_folder_name}' 文件夹为空")
             return True
         else:
-            print(f"  ❌ 错误：保留的 '{self.keep_folder_name}' 文件夹不存在或已被删除")
+            print(f"  [FAIL] 保留的 '{self.keep_folder_name}' 文件夹不存在或已被删除")
             return False
     
     def compress_folder(self, target_folder_path, output_path=None):
@@ -384,28 +367,28 @@ class FolderCompressor:
                     bag_start_time_ns = reader.start_time
                     bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
                     bag_date = bag_datetime.strftime('%Y%m%d')
-                    print(f"📅 使用 bag 实际数据时间作为日期: {bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
+                    print(f"  Bag数据日期: {bag_date} ({bag_datetime.strftime('%Y-%m-%d %H:%M:%S')})")
             except Exception as e:
-                print(f"⚠️ 无法从 bag 获取时间戳，使用当前日期: {e}")
+                print(f"  [WARN] 无法从bag获取时间戳，使用当前日期: {e}")
                 bag_date = datetime.now().strftime('%Y%m%d')
         else:
             if not self.bag_path:
-                print(f"⚠️ 未提供 bag 路径，使用当前日期")
+                print(f"  [WARN] 未提供bag路径，使用当前日期")
             bag_date = datetime.now().strftime('%Y%m%d')
 
         if output_path:
             zip_path = Path(output_path)
             # 如果文件名包含 PLACEHOLDER，替换为实际日期
             if 'PLACEHOLDER' in zip_path.name:
-                # 提取时间段部分（HHMMSS-HHMMSS）
+                # 提取时间段部分（HHMMSS_HHMMSS）
                 import re
-                time_pattern = r'(\d{6}-\d{6})'
+                time_pattern = r'(\d{6}_\d{6})'
                 match = re.search(time_pattern, zip_path.name)
                 if match:
                     time_range = match.group(1)
                     new_filename = f"{bag_date}_{time_range}.zip"
                     zip_path = zip_path.parent / new_filename
-                    print(f"📝 压缩文件名: {new_filename}")
+                    print(f"  压缩文件名: {new_filename}")
             zip_filename = zip_path.name
         else:
             # 压缩包保存到root_dir下，添加日期前缀
@@ -414,11 +397,11 @@ class FolderCompressor:
 
         # 如果压缩包已存在，直接覆盖（无需确认）
         if zip_path.exists():
-            print(f"  ⚠️  压缩包 {zip_filename} 已存在，将直接覆盖")
+            print(f"  [WARN] 压缩包 {zip_filename} 已存在，将覆盖")
             zip_path.unlink()  # 删除已存在的压缩包
 
         try:
-            print(f"  📦 开始压缩文件夹（仅包含 '{self.keep_folder_name}' 目录）...")
+            print(f"  压缩中...")
             skipped_files = 0
             compressed_files = 0
 
@@ -447,7 +430,7 @@ class FolderCompressor:
                             skipped_files += 1
                             continue
                         except Exception as e:
-                            print(f"  ⚠️  跳过文件 {file_path.name}: {str(e)}")
+                            print(f"  [WARN] 跳过文件 {file_path.name}: {str(e)}")
                             skipped_files += 1
                             continue
 
@@ -455,17 +438,15 @@ class FolderCompressor:
             zip_size_bytes = zip_path.stat().st_size
             zip_size_formatted = self.format_file_size(zip_size_bytes)
 
-            print(f"  ✅ 压缩完成: {zip_filename}")
-            print(f"  📊 压缩包大小: {zip_size_formatted}")
-            print(f"  📍 压缩包路径: {zip_path}")
+            print(f"  [OK] 压缩完成: {zip_filename} ({zip_size_formatted})")
+            print(f"  路径: {zip_path}")
 
-            # 如果小于最小配置大小，给出警告
             if zip_size_bytes < self.min_zip_size_bytes:
-                print(f"  ⚠️  警告: 压缩包大小小于 {self.min_zip_size_gb}GB，可能存在数据不完整！")
+                print(f"  [WARN] 压缩包 < {self.min_zip_size_gb}GB，可能数据不完整")
 
             return str(zip_path)  # 返回实际生成的压缩包路径
         except Exception as e:
-            print(f"  ❌ 压缩失败: {e}")
+            print(f"  [FAIL] 压缩失败: {e}")
             # 如果压缩失败且文件已创建，删除不完整的压缩包
             if zip_path.exists():
                 zip_path.unlink()
@@ -479,21 +460,17 @@ class FolderCompressor:
     def process_single_undistorted_folder(self, undistorted_path, compress_path):
         """处理单个undistorted文件夹（Pipeline模式），返回实际生成的压缩包路径"""
         target_folder = Path(undistorted_path)
-        print(f"\n📂 正在处理单个文件夹: {target_folder}")
-        print("-" * 50)
+        print(f"\n  处理文件夹: {target_folder}")
 
-        # 检查磁盘空间 (检查压缩包所在目录)
         compress_dir = Path(compress_path).parent
         if not compress_dir.exists():
             compress_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n📊 正在检查磁盘空间 (目标: {compress_dir})...")
         free_space = self.get_free_disk_space(compress_dir)
         if free_space >= 0:
             free_space_gb = free_space / (1024 * 1024 * 1024)
-            print(f"  📈 磁盘剩余空间: {free_space_gb:.2f} GB")
             if free_space < self.required_free_space_bytes:
-                print(f"  ❌ 磁盘空间不足！所需: {self.required_free_space_gb} GB")
+                print(f"  [FAIL] 磁盘空间不足: {free_space_gb:.1f}GB < {self.required_free_space_gb}GB")
                 return None
 
         # 执行检查
@@ -513,10 +490,10 @@ class FolderCompressor:
 
             actual_compress_path = self.compress_folder(target_folder, output_path=compress_path)
             if actual_compress_path:
-                print(f"✅ 压缩成功: {actual_compress_path}")
+                print(f"  [OK] 压缩成功: {actual_compress_path}")
                 return actual_compress_path
         else:
-            print(f"  ❌ 检查未通过，跳过压缩")
+            print(f"  [FAIL] 检查未通过，跳过压缩")
 
         return None
 
@@ -524,7 +501,7 @@ class FolderCompressor:
         """处理root_dir下所有时间格式的子文件夹"""
         # 验证根目录是否存在
         if not self.root_dir.exists():
-            print(f"❌ 错误: 根目录不存在: {self.root_dir}")
+            print(f"  [FAIL] 根目录不存在: {self.root_dir}")
             return
         
         # 查找所有时间格式的子文件夹（直接子目录）并按名称排序
@@ -540,14 +517,12 @@ class FolderCompressor:
         successful_compressions = 0
         
         for idx, target_folder in enumerate(target_folders, 1):
-            print(f"\n📂 正在处理 [{idx}/{len(target_folders)}]: {target_folder.name}")
-            print("-" * 50)
+            print(f"\n  处理 [{idx}/{len(target_folders)}]: {target_folder.name}")
             
             # 处理每个文件夹前先检查磁盘空间
             if not self.check_disk_space():
                 # 空间不足，直接终止程序
-                print(f"\n❌ 磁盘空间不足，程序终止！")
-                print(f"已成功处理 {successful_compressions}/{idx-1} 个文件夹")
+                print(f"\n  [FAIL] 磁盘空间不足，终止! 已处理 {successful_compressions}/{idx-1}")
                 return
             
             # 执行所有检查（均基于undistorted目录）
@@ -570,18 +545,17 @@ class FolderCompressor:
                 print(f" 所有检查通过，开始清理文件夹...")
                 # 清理文件夹（无确认）
                 if not self.clean_folder_before_compress(target_folder):
-                    print(f"  ❌ 清理失败，跳过压缩")
+                    print(f"  [FAIL] 清理失败，跳过压缩")
                     continue
                 
                 # 清理成功后进行压缩
                 if self.compress_folder(target_folder):
                     successful_compressions += 1
             else:
-                print(f"  ❌ 检查未通过，跳过压缩")
+                print(f"  [FAIL] 检查未通过，跳过压缩")
             print("-" * 50)
-        
-        print(f"\n" + "="*60)
-        print(f"📊 处理完成! 成功压缩 {successful_compressions}/{len(target_folders)} 个文件夹")
+
+        print(f"\n  处理完成: 成功压缩 {successful_compressions}/{len(target_folders)}")
 
 def main():
     """主函数"""
@@ -596,7 +570,7 @@ def main():
 
     if args.undistorted_path and args.compress_path:
         # Pipeline模式
-        print("🚀 启动 Pipeline 单文件夹处理模式")
+        print("  Pipeline 单文件夹处理模式")
         # root_dir 设置为 undistorted_path 的父目录，以便计算相对路径
         root_dir = Path(args.undistorted_path).parent
         compressor = FolderCompressor(root_dir, args.bag_path)
@@ -604,16 +578,15 @@ def main():
 
         # 输出实际生成的压缩包路径，供 pipline.py 读取
         if actual_compress_path:
-            print(f"\n✅ COMPRESS_SUCCESS: {actual_compress_path}")
+            print(f"\nCOMPRESS_SUCCESS: {actual_compress_path}")
         else:
-            print(f"\n❌ COMPRESS_FAILED")
+            print(f"\nCOMPRESS_FAILED")
         return
 
-    print("📁 文件夹批量压缩工具（基于undistorted目录 + 自动清理 + 无确认 + 磁盘空间检查）")
+    print("  文件夹批量压缩工具 (基于undistorted目录)")
     print("=" * 60)
-    print("⚠️  警告：程序会自动删除目标文件夹中除 'undistorted' 外的所有内容，不可逆！")
-    print(f"⚠️  要求：目标目录剩余空间需大于 50 GB")
-    print(f"⚠️  说明：所有数据检查均基于 'undistorted' 子目录")
+    print("  注意: 会自动删除目标文件夹中除 'undistorted' 外的所有内容")
+    print(f"  要求: 目标目录剩余空间 > 50 GB")
     print("=" * 60)
 
     # 根目录：包含所有时间格式子文件夹的目录

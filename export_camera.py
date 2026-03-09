@@ -96,7 +96,7 @@ def create_pipeline(topic_name_sanitized, use_hw_accel="auto"):
         f"appsrc name={topic_name_sanitized} format=time stream-type=stream caps=video/x-h265,stream-format=byte-stream,alignment=au ! "
         f"h265parse config-interval=1 ! {decoder} ! "
         "videoconvert ! video/x-raw,format=BGR ! "
-        "appsink name=sink emit-signals=True max-buffers=100 drop=False sync=false"
+        "appsink name=sink emit-signals=True max-buffers=50 drop=False sync=false"
     )
     return Gst.parse_launch(pipeline_str)
 
@@ -164,98 +164,116 @@ def decode_worker(topic_name, data_queue, base_output_dir, hw_accel_flag, shared
     topic_name_sanitized = topic_name_sanitized.lstrip('_')
     output_dir = os.path.join(base_output_dir, topic_name_sanitized)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     print(f"[{topic_name}] Worker started. Outputting to: {output_dir}")
 
-    main_loop = GLib.MainLoop()
-    eos_received = threading.Event()
-    
     # 初始化共享计数器
     if topic_name not in shared_counters:
         shared_counters[topic_name] = {'pushed': 0, 'decoded': 0}
     counters = shared_counters[topic_name]
-    
-    # 创建一个最多有8个线程的写入池（减少并发，避免磁盘I/O瓶颈）
-    writer_pool = ThreadPoolExecutor(max_workers=8)
-    # 创建信号量限制待写入队列长度，防止内存溢出 (200张图片，增加缓冲避免死锁)
-    semaphore = threading.BoundedSemaphore(value=200)
-    
-    pipeline = create_pipeline(topic_name_sanitized, hw_accel_flag)
-    
-    user_data_for_callback = (output_dir, topic_name, counters, writer_pool, semaphore)  # 移除timestamps
-    sink = pipeline.get_by_name('sink')
-    sink.connect("new-sample", on_new_sample, user_data_for_callback)
 
-    bus = pipeline.get_bus()
-    bus.add_signal_watch()
-    def on_bus_message(bus, message):
-        t = message.type
-        if t == Gst.MessageType.EOS:
-            print(f"\n[{topic_name}] Received EOS from pipeline.")
-            eos_received.set()
-            main_loop.quit()
-        elif t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print(f"\n[{topic_name}] GStreamer Error: {err}. {debug}", file=sys.stderr)
-            main_loop.quit()
-        return True
-    bus.connect("message", on_bus_message)
-
-    appsrc = pipeline.get_by_name(topic_name_sanitized)
-    appsrc.set_property('is-live', False)
-    appsrc.set_property('format', Gst.Format.TIME)
-    # 设置合理的队列大小限制，提供背压
-    appsrc.set_property('max-bytes', 100 * 1024 * 1024)  # 100MB buffer
-    appsrc.set_property('block', True)
-
-    pipeline.set_state(Gst.State.PLAYING)
-    loop_thread = threading.Thread(target=main_loop.run, daemon=True)
-    loop_thread.start()
+    # 初始化对象引用（用于finally清理）
+    pipeline = None
+    writer_pool = None
+    loop_thread = None
+    sink = None
+    appsrc = None
+    bus = None
+    main_loop = None
 
     try:
-        while True:
-            item = data_queue.get()
-            if item is None: break
-            
-            timestamp, h265_data = item
-            counters['pushed'] += 1
-            buf = Gst.Buffer.new_wrapped(h265_data)
-            buf.pts = timestamp  # 设置PTS（纳秒单位，直接赋值）
-            buf.dts = Gst.CLOCK_TIME_NONE  # 可选：decode timestamp，通常不需设置
-            
-            # push-buffer会阻塞直到pipeline有空间，提供自然的背压
-            ret = appsrc.emit('push-buffer', buf)
-            if ret != Gst.FlowReturn.OK:
-                print(f"[{topic_name}] push-buffer returned {ret}", file=sys.stderr)
-                break
-    except Exception as e:
-        print(f"[{topic_name}] Error in push loop: {e}", file=sys.stderr)
+        # 创建写入池和信号量
+        writer_pool = ThreadPoolExecutor(max_workers=6)
+        semaphore = threading.BoundedSemaphore(value=100)
 
-    print(f"[{topic_name}] Sending EOS to appsrc...")
-    appsrc.emit('end-of-stream')
+        main_loop = GLib.MainLoop()
+        eos_received = threading.Event()
 
-    print(f"[{topic_name}] Waiting for pipeline to finish processing...")
-    # 等待EOS事件，不设置超时，让pipeline完整处理所有帧
-    eos_received.wait()
-    
-    # 等待主循环线程结束
-    loop_thread.join(timeout=5.0)
-    if loop_thread.is_alive():
-        print(f"[{topic_name}] Main loop still running, forcing quit...")
-        main_loop.quit()
-        loop_thread.join(timeout=2.0)
+        pipeline = create_pipeline(topic_name_sanitized, hw_accel_flag)
 
-    # 先停止pipeline，防止新的回调触发
-    pipeline.set_state(Gst.State.NULL)
-    
-    # 等待所有写入任务完成
-    writer_pool.shutdown(wait=True)
-    
-    print(f"\r[{topic_name}] Finalizing...")
-    print(f"--- Summary for Topic: {topic_name} ---")
-    print(f"  Frames pushed to decoder: {counters['pushed']}")
-    print(f"  Frames successfully decoded: {counters['decoded']}")
-    print("--------------------------------------------------")
+        user_data_for_callback = (output_dir, topic_name, counters, writer_pool, semaphore)
+        sink = pipeline.get_by_name('sink')
+        sink.connect("new-sample", on_new_sample, user_data_for_callback)
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        def on_bus_message(bus_msg, message):
+            t = message.type
+            if t == Gst.MessageType.EOS:
+                print(f"\n[{topic_name}] Received EOS from pipeline.")
+                eos_received.set()
+                main_loop.quit()
+            elif t == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                print(f"\n[{topic_name}] GStreamer Error: {err}. {debug}", file=sys.stderr)
+                main_loop.quit()
+            return True
+        bus.connect("message", on_bus_message)
+
+        appsrc = pipeline.get_by_name(topic_name_sanitized)
+        appsrc.set_property('is-live', False)
+        appsrc.set_property('format', Gst.Format.TIME)
+        appsrc.set_property('max-bytes', 50 * 1024 * 1024)  # 50MB buffer
+        appsrc.set_property('block', True)
+
+        pipeline.set_state(Gst.State.PLAYING)
+        loop_thread = threading.Thread(target=main_loop.run, daemon=True)
+        loop_thread.start()
+
+        try:
+            while True:
+                item = data_queue.get()
+                if item is None: break
+
+                timestamp, h265_data = item
+                counters['pushed'] += 1
+                buf = Gst.Buffer.new_wrapped(h265_data)
+                buf.pts = timestamp
+                buf.dts = Gst.CLOCK_TIME_NONE
+
+                ret = appsrc.emit('push-buffer', buf)
+                if ret != Gst.FlowReturn.OK:
+                    print(f"[{topic_name}] push-buffer returned {ret}", file=sys.stderr)
+                    break
+        except Exception as e:
+            print(f"[{topic_name}] Error in push loop: {e}", file=sys.stderr)
+
+        print(f"[{topic_name}] Sending EOS to appsrc...")
+        appsrc.emit('end-of-stream')
+
+        print(f"[{topic_name}] Waiting for pipeline to finish processing...")
+        eos_received.wait()
+
+        if loop_thread:
+            loop_thread.join(timeout=5.0)
+            if loop_thread.is_alive():
+                print(f"[{topic_name}] Main loop still running, forcing quit...")
+                main_loop.quit()
+                loop_thread.join(timeout=2.0)
+
+        print(f"\r[{topic_name}] Finalizing...")
+        print(f"--- Summary for Topic: {topic_name} ---")
+        print(f"  Frames pushed to decoder: {counters['pushed']}")
+        print(f"  Frames successfully decoded: {counters['decoded']}")
+        print("--------------------------------------------------")
+
+    finally:
+        # 显式清理资源，防止内存泄漏
+        if pipeline:
+            pipeline.set_state(Gst.State.NULL)
+        if writer_pool:
+            writer_pool.shutdown(wait=True)
+
+        # 强制释放GStreamer对象引用
+        pipeline = None
+        sink = None
+        appsrc = None
+        bus = None
+        main_loop = None
+
+        # 建议垃圾回收
+        import gc
+        gc.collect()
 
 def get_all_bags(input_path):
     """获取所有bag目录，支持单目录和多目录模式"""
@@ -295,17 +313,64 @@ def main():
         description="Decode H.265 data from multiple continuous ROS2 bags.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    
+
     parser.add_argument("--bag", required=True, help="要导出ROS2 bag 的根目录，里面包含多个 bag 子目录")
     parser.add_argument("--out", required=True, help="输出根目录,目录若存在将会删除")
 
-    parser.add_argument("--hwaccel", type=str, default="none", choices=['none', 'nvidia', 'vaapi'], 
+    parser.add_argument("--hwaccel", type=str, default="none", choices=['none', 'nvidia', 'vaapi'],
                         help="Specify hardware acceleration method.")
+    parser.add_argument("--start-time", type=str, help="开始时间 (HHMMSS 格式)")
+    parser.add_argument("--end-time", type=str, help="结束时间 (HHMMSS 格式)")
     args = parser.parse_args()
+
+    # 解析时间参数
+    start_time_ns = None
+    end_time_ns = None
+    if args.start_time and args.end_time:
+        try:
+            # 从 bag 获取日期
+            temp_bag_path = args.bag
+            if not os.path.exists(os.path.join(temp_bag_path, "metadata.yaml")):
+                for entry in sorted(os.listdir(temp_bag_path)):
+                    candidate = os.path.join(temp_bag_path, entry)
+                    if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "metadata.yaml")):
+                        temp_bag_path = candidate
+                        break
+
+            with AnyReader([Path(temp_bag_path)]) as reader:
+                bag_start_time_ns = reader.start_time
+                bag_datetime = datetime.fromtimestamp(bag_start_time_ns / 1e9)
+                bag_date = bag_datetime.date()
+
+                # 解析用户时间
+                start_hh = int(args.start_time[:2])
+                start_mm = int(args.start_time[2:4])
+                start_ss = int(args.start_time[4:6])
+                end_hh = int(args.end_time[:2])
+                end_mm = int(args.end_time[2:4])
+                end_ss = int(args.end_time[4:6])
+
+                start_dt = datetime.combine(bag_date, datetime.min.time()).replace(
+                    hour=start_hh, minute=start_mm, second=start_ss
+                )
+                end_dt = datetime.combine(bag_date, datetime.min.time()).replace(
+                    hour=end_hh, minute=end_mm, second=end_ss
+                )
+
+                start_time_ns = int(start_dt.timestamp() * 1e9)
+                end_time_ns = int(end_dt.timestamp() * 1e9)
+
+                print(f"⏰ 时间范围过滤: {args.start_time} - {args.end_time}")
+                print(f"   转换为: {start_dt} - {end_dt}")
+                print(f"   纳秒时间戳: {start_time_ns} - {end_time_ns}")
+        except Exception as e:
+            print(f"⚠️  警告: 无法解析时间参数，将导出所有数据: {e}")
+            start_time_ns = None
+            end_time_ns = None
 
     threads, data_queues = {}, {}
     shared_counters = {}  # 所有线程共享的计数器字典
-    
+
     # 启动进度监控线程
     monitor = ProgressMonitor(shared_counters, interval=2.0)
     monitor.start()
@@ -332,9 +397,12 @@ def main():
 
     bag_paths = get_all_bags(args.bag)
 
+    total_messages_read = 0
+    total_messages_filtered = 0
+
     try:
         with AnyReader(bag_paths) as reader:
-            
+
             # 这个循环现在会无缝地遍历所有bag文件中的所有消息
             for connection, timestamp, rawdata in reader.messages():
                 if connection.msgtype != 'sensor_msgs/msg/Image': continue
@@ -342,11 +410,19 @@ def main():
                 if topic_name not in ALL_CAMERA_H265_TOPICS:
                     print(f"\nSkipping topic: {topic_name}")
                     continue
-                
+
+                total_messages_read += 1
+
+                # 时间范围过滤
+                if start_time_ns is not None and end_time_ns is not None:
+                    if timestamp < start_time_ns or timestamp > end_time_ns:
+                        total_messages_filtered += 1
+                        continue
+
                 # 线程和管线只在第一次遇到topic时创建
                 if topic_name not in threads:
                     print(f"\nDiscovered new topic: {topic_name}. Starting worker thread.")
-                    q = queue.Queue(maxsize=1000)
+                    q = queue.Queue(maxsize=5000)
                     data_queues[topic_name] = q
                     # 这个线程将存活，直到所有bag文件都被处理完毕
                     thread = threading.Thread(target=decode_worker, args=(topic_name, q, args.out, args.hwaccel, shared_counters))
@@ -364,15 +440,17 @@ def main():
     finally:
         # 这个 'finally' 块只在所有bag文件都被处理完毕后才会执行
         print("\nEnd of all bag files reached. Signaling worker threads to finalize...")
+        if start_time_ns is not None and end_time_ns is not None:
+            print(f"[INFO] 时间过滤统计: 总读取 {total_messages_read} 帧，过滤掉 {total_messages_filtered} 帧，保留 {total_messages_read - total_messages_filtered} 帧")
         for q in data_queues.values(): q.put(None)
-        
+
         # 停止监控线程（在join之前，避免继续打印）
         monitor.stop()
         monitor.join()
-        
+
         # 等待所有worker线程完成
         for t in threads.values(): t.join()
-        
+
         print(f"\nAll decoding threads have finished. Program terminated. Output is in '{args.out}'")
 
 if __name__ == '__main__':
