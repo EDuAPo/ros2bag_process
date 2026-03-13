@@ -43,7 +43,8 @@ TYPE_MAP = {
 # 忽略的 Topic 列表
 IGNORE_TOPICS = [
     "/jinlvlomp/localization/local_map_debug",
-    "/jinlvlomp/localization/match_result_debug"
+    "/jinlvlomp/localization/match_result_debug",
+    "_transformed"
 ]
 
 # --- 【最终优化】直接从消息字节缓冲区读取点云数据 ---
