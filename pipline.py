@@ -511,7 +511,7 @@ def run_check_and_compress(
     period_idx: int,
     start_time: str,
     end_time: str,
-    bag_path: str = None
+    bag_date: str = None
 ) -> str:
     """调用外部检查压缩脚本，执行压缩流程，返回实际生成的压缩包路径"""
     # 注意：不在这里生成文件名，让 check_and_compress.py 根据 bag 时间戳生成
@@ -527,8 +527,8 @@ def run_check_and_compress(
         f"--period {start_time}_{end_time}"
     )
 
-    if bag_path:
-        check_compress_cmd += f" --bag-path {bag_path}"
+    if bag_date:
+        check_compress_cmd += f" --bag-date {bag_date}"
 
     result = run_shell_command(
         check_compress_cmd,
@@ -855,7 +855,7 @@ def process_single_period(
                     period_idx=period_idx,
                     start_time=start_time,
                     end_time=end_time,
-                    bag_path=source_dir  # 传递原始 bag 路径以获取实际数据时间
+                    bag_date=bag_date  # 直接传递已获取的bag日期，避免重复读取bag
                 )
                 period_log["steps"].append({
                     "step_name": "检查+压缩",

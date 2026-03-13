@@ -14,9 +14,10 @@ except ImportError:
     AnyReader = None
 
 class FolderCompressor:
-    def __init__(self, root_dir, bag_path=None):
+    def __init__(self, root_dir, bag_path=None, bag_date=None):
         self.root_dir = Path(root_dir)
         self.bag_path = bag_path  # ROS2 bag 路径，用于获取时间戳
+        self.bag_date = bag_date  # 直接指定的日期（YYYYMMDD），优先于 bag_path
         # 配置项 - 请根据实际情况修改
         self.required_json_files = ['sensor_config_combined_latest.json', 'ins.json', 'sample.json']  # 必需的JSON文件列表
         self.folder_groups = [
@@ -360,8 +361,11 @@ class FolderCompressor:
     
     def compress_folder(self, target_folder_path, output_path=None):
         """压缩文件夹，并检查压缩包大小"""
-        # 获取日期：优先从 bag 获取，否则使用当前日期
-        if self.bag_path and AnyReader:
+        # 获取日期：优先使用直接指定的日期，其次从 bag 获取，最后使用当前日期
+        if self.bag_date:
+            bag_date = self.bag_date
+            print(f"  Bag数据日期: {bag_date} (直接指定)")
+        elif self.bag_path and AnyReader:
             try:
                 with AnyReader([Path(self.bag_path)]) as reader:
                     bag_start_time_ns = reader.start_time
@@ -565,6 +569,7 @@ def main():
     parser.add_argument("--compress-format", type=str, default="zip", help="压缩格式")
     parser.add_argument("--period", type=str, help="时间段标识")
     parser.add_argument("--bag-path", type=str, help="ROS2 bag 路径，用于获取时间戳作为压缩文件名日期")
+    parser.add_argument("--bag-date", type=str, help="直接指定bag数据日期（YYYYMMDD格式），优先于--bag-path")
 
     args, unknown = parser.parse_known_args()
 
@@ -573,7 +578,7 @@ def main():
         print("  Pipeline 单文件夹处理模式")
         # root_dir 设置为 undistorted_path 的父目录，以便计算相对路径
         root_dir = Path(args.undistorted_path).parent
-        compressor = FolderCompressor(root_dir, args.bag_path)
+        compressor = FolderCompressor(root_dir, args.bag_path, bag_date=args.bag_date)
         actual_compress_path = compressor.process_single_undistorted_folder(args.undistorted_path, args.compress_path)
 
         # 输出实际生成的压缩包路径，供 pipline.py 读取

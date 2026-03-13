@@ -358,8 +358,7 @@ def generate_key_frames(root_dir, copy_sample, max_time_diff_ms):
                         else:
                             print(f"Warning: 源文件不存在，无法拷贝: {src_path}")
             else:
-                # 只有camera_cam_8M_pt_front可以标记为NOT_FOUND
-                record[topic] = "NOT_FOUND" if topic == 'camera_cam_8M_pt_front' else filename
+                record[topic] = "NOT_FOUND"
         
         # 匹配 INS 记录
         if all_ins_data:
